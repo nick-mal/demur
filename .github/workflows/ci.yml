@@ -1,0 +1,32 @@
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies and sync environment
+        run: uv sync --all-extras --dev
+
+      - name: Run Ruff linter check
+        run: uv run --frozen ruff check .
+
+      - name: Run Ruff format check
+        run: uv run --frozen ruff format --check .
+
+      - name: Run test suite with pytest
+        run: uv run --frozen pytest

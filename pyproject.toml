@@ -1,0 +1,16 @@
+[project]
+name = "demur"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "mlflow",
+    "httpx",
+    "duckdb",
+    "pydantic",
+    "opentelemetry-sdk",
+    "fastapi",
+    "numpy",
+    "pytest",
+    "ruff"
+]
+
