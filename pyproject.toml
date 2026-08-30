@@ -1,6 +1,6 @@
 [project]
 name = "demur"
-version = "0.1.0"
+version = "0.1.1"
 requires-python = ">=3.13"
 dependencies = [
     "mlflow",
@@ -14,3 +14,39 @@ dependencies = [
     "ruff"
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demur"]
+
+[tool.ruff.lint]
+# Explicit, because "ruff check passes" has to mean something. Defaults are
+# pyflakes plus a few pycodestyle rules, which would let a naive datetime or a
+# dead `# noqa` through the gate the plan treats as a quality bar.
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # import sorting
+    "N",         # pep8 naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "A",         # shadowed builtins
+    "C4",        # comprehensions
+    "DTZ",       # naive datetimes — timestamps in a manifest must be absolute
+    "PT",        # pytest style
+    "RET",       # return simplification
+    "SIM",       # simplification
+    "ARG",       # unused arguments
+    "PTH",       # pathlib over os.path
+    "RUF",       # ruff's own rules, including RUF100 for dead noqa directives
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures are passed by name and are often used for their side effect of
+# building the object under test rather than read directly.
+"tests/*" = ["ARG001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
