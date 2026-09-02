@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from demur.sampling import Sampling
 from demur.trajectory import (
     SCHEMA_VERSION,
     LLMCall,
@@ -39,9 +40,12 @@ def test_round_trips_through_json(trajectory: Trajectory) -> None:
 def test_the_golden_fixture_still_loads_and_matches(trajectory: Trajectory) -> None:
     """A committed run must outlive the code that wrote it.
 
-    If this fails, either the schema changed without a `schema_version` bump
-    and a loader for version 1, or the fixture was edited to suit new code.
-    Neither is allowed: the fixture stands in for every run in `runs/`.
+    Until D-37 commits the first real run, this fixture is the only artifact
+    holding the schema still, and regenerating it is a deliberate act rather
+    than a forbidden one — nothing published depends on it yet. After D-37 a
+    failure here means the schema moved under committed evidence, and the
+    answer is a `schema_version` bump with a converting loader, never an edit
+    to a file in `runs/`.
     """
 
     assert load_trajectory(GOLDEN.read_text(encoding="utf-8")) == (trajectory)
@@ -148,11 +152,23 @@ def test_a_blocked_outcome_has_no_result() -> None:
         ToolOutcome(status="blocked", result={"rows": []})
 
 
+def local_usage(*, input_tokens: int, output_tokens: int, **kw: int) -> Usage:
+    """A normalised report from a provider with no cache rates."""
+
+    return Usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=0,
+        cache_creation_input_tokens=0,
+        **kw,
+    )
+
+
 def test_unreported_usage_is_not_zero() -> None:
     """`None` means the provider said nothing, which is not free."""
 
     assert Usage().total_tokens is None
-    assert Usage(input_tokens=10, output_tokens=5, cached_input_tokens=0).total_tokens
+    assert local_usage(input_tokens=10, output_tokens=5).total_tokens
 
 
 @pytest.mark.parametrize(
@@ -160,8 +176,11 @@ def test_unreported_usage_is_not_zero() -> None:
     [
         {"input_tokens": 10, "output_tokens": 5},
         {"cached_input_tokens": 7},
+        {"cache_creation_input_tokens": 7},
         {"reasoning_tokens": 5},
         {"output_tokens": 5, "cached_input_tokens": 0},
+        # The bucket a provider without a cache-write premium must still fill.
+        {"input_tokens": 10, "output_tokens": 5, "cached_input_tokens": 0},
     ],
 )
 def test_half_reported_usage_is_rejected(partial: dict[str, int]) -> None:
@@ -185,7 +204,7 @@ def test_a_provider_that_says_nothing_is_still_legal() -> None:
 def test_reasoning_stays_optional_within_a_reported_usage() -> None:
     """Most providers report no reasoning bucket at all."""
 
-    usage = Usage(input_tokens=10, output_tokens=5, cached_input_tokens=0)
+    usage = local_usage(input_tokens=10, output_tokens=5)
 
     assert usage.reasoning_tokens is None
     assert usage.total_tokens == 15
@@ -197,6 +216,63 @@ def test_total_counts_each_prompt_bucket_once_and_excludes_reasoning(
     usage = trajectory.llm_calls[0].usage
 
     assert usage.total_tokens == 449
+
+
+def test_a_local_model_reports_prompt_and_completion_and_nothing_else() -> None:
+    """The shape demur's own quick start produces.
+
+    Ollama, llama.cpp and vLLM behind an OpenAI-compatible endpoint report a
+    prompt count and a completion count. Both cache buckets are `0` — not
+    because no KV cache exists, but because no *rate* does, and these are
+    billing buckets. An engine reusing a prefix underneath does not make the
+    zero wrong; `economics.py` prices tokens, it does not audit inference
+    engines.
+    """
+
+    usage = local_usage(input_tokens=1_204, output_tokens=88)
+
+    assert usage.reported
+    assert usage.total_tokens == 1_292
+    assert usage.cached_input_tokens == 0
+    assert usage.cache_creation_input_tokens == 0
+
+
+def test_cache_writes_are_their_own_bucket() -> None:
+    """Folding them into `input_tokens` would keep the total right and lose
+    the price: a cache write bills at a premium over ordinary input, so the
+    run that populates a cache costs more than the run that reads it. T2 adds
+    few-shot exemplars — exactly the content worth caching — which is where
+    that difference lands hardest."""
+
+    writing = Usage(
+        input_tokens=100,
+        output_tokens=20,
+        cached_input_tokens=0,
+        cache_creation_input_tokens=900,
+    )
+    reading = Usage(
+        input_tokens=100,
+        output_tokens=20,
+        cached_input_tokens=900,
+        cache_creation_input_tokens=0,
+    )
+
+    assert writing.total_tokens == reading.total_tokens == 1_020
+    assert writing != reading
+
+
+def test_reported_collapses_once_validation_has_run() -> None:
+    """The breadth of `reported` is for the validator, not for callers.
+
+    It has to see all five fields so `Usage(cached_input_tokens=7)` fails
+    rather than passing as "nothing reported". Afterwards only two states
+    survive — everything `None`, or every bucket filled — so on a constructed
+    `Usage` it says exactly what `input_tokens is not None` says. Pinned so
+    that a future field cannot widen the state space unnoticed.
+    """
+
+    for usage in (Usage(), local_usage(input_tokens=1, output_tokens=1)):
+        assert usage.reported == (usage.input_tokens is not None)
 
 
 def test_reasoning_cannot_exceed_output() -> None:
@@ -478,3 +554,169 @@ def test_unknown_fields_are_rejected(trajectory: Trajectory) -> None:
 
     with pytest.raises(ValidationError):
         load_trajectory(payload)
+
+
+def test_a_call_records_the_parameters_it_was_actually_sent_with() -> None:
+    """`prompt_at()` plus `model` plus this is the whole request.
+
+    A trajectory has to be readable a year later without the run that produced
+    it, so the parameters that shaped a reply cannot live only on the manifest
+    — otherwise reproducing one call means finding a second artifact first.
+    """
+
+    call = LLMCall(
+        index=0,
+        model="local:qwen3",
+        messages_appended=[Message(role="user", content="total sales in June")],
+        response_text="1,963.10",
+        sampling=Sampling(temperature=0.7, top_p=0.95, seed=11, stop=("\n\n",)),
+    )
+
+    assert call.sampling.temperature == 0.7
+    assert LLMCall.model_validate_json(call.model_dump_json()) == call
+
+
+def test_a_call_may_differ_from_what_the_run_was_configured_with() -> None:
+    """The divergence is the evidence, not an inconsistency.
+
+    A retry at a higher temperature after a malformed tool call is a recovery
+    strategy demur measures, and a fault profile rewriting a request is one it
+    injects. A schema that recorded sampling only once — on the manifest —
+    could not express either, and both would read as runs that behaved oddly
+    for no recorded reason.
+    """
+
+    configured = Sampling(temperature=0)
+    retried = Sampling(temperature=0.8)
+
+    assert configured != retried
+
+
+def test_temperature_zero_is_not_the_same_as_unspecified() -> None:
+    """`None` means the provider chose. Zero means we did, and chose greedy.
+
+    Collapsing them would turn "we do not know how this was decoded" into "this
+    was deterministic" — the same failure `Usage` guards against when it
+    refuses to read an unreported token count as free.
+    """
+
+    assert Sampling(temperature=0).specified is True
+    assert Sampling().specified is False
+    assert Sampling(temperature=0) != Sampling()
+
+
+def test_reasoning_survives_into_a_rebuilt_prompt() -> None:
+    """A provider continuing a turn that contained thinking expects it back.
+
+    This is why `reasoning_text` is on `Message` as well as on `LLMCall`: the
+    reply is rendered into a turn by `assistant_turn`, and a rebuilt prompt
+    that dropped the thinking would not be the conversation that happened.
+    """
+
+    call = LLMCall(
+        index=0,
+        model="local:qwen3",
+        messages_appended=[Message(role="user", content="total sales in June")],
+        reasoning_text="Two date columns could anchor 'June'. Neither is named.",
+        response_text="Which date should I anchor on?",
+    )
+
+    turn = call.assistant_turn
+
+    assert turn is not None
+    assert turn.reasoning_text == call.reasoning_text
+    assert turn.content == "Which date should I anchor on?"
+
+
+def test_thinking_alone_is_not_a_turn() -> None:
+    """Reasoning is what led to a turn, not a turn.
+
+    A model that only thought and neither spoke nor called a tool has produced
+    nothing to append to the conversation, so it contributes no message — the
+    same rule that keeps a provider error from contributing one.
+    """
+
+    call = LLMCall(
+        index=0,
+        model="local:qwen3",
+        messages_appended=[Message(role="user", content="hello")],
+        reasoning_text="thinking about it",
+    )
+
+    assert call.assistant_turn is None
+
+    with pytest.raises(ValidationError, match="neither content nor tool calls"):
+        Message(role="assistant", reasoning_text="thinking about it")
+
+
+def test_only_the_model_reasons() -> None:
+    """Attributing thinking to a user or a tool result would put words in the
+    wrong mouth on replay."""
+
+    for role in ("user", "system", "tool"):
+        with pytest.raises(ValidationError, match="carries reasoning text"):
+            Message(
+                role=role,
+                content="text",
+                reasoning_text="not mine",
+                tool_call_id="call-1" if role == "tool" else None,
+            )
+
+
+def test_reasoning_tokens_without_text_is_the_normal_case() -> None:
+    """No validator ties `reasoning_text` to `usage.reasoning_tokens`.
+
+    They vary independently in both directions, and a rule demanding both
+    would reject two correct adapters. Current Anthropic models bill thinking
+    while returning no raw chain of thought at all — tokens without text is
+    what a correct adapter records, not a recording bug. A local model behind
+    vLLM does the reverse: it returns `reasoning_content` while reporting no
+    separate token count.
+    """
+
+    billed_but_hidden = LLMCall(
+        index=0,
+        model="claude-opus-5",
+        messages_appended=[Message(role="user", content="q")],
+        response_text="a",
+        usage=Usage(
+            input_tokens=10,
+            output_tokens=50,
+            cached_input_tokens=0,
+            cache_creation_input_tokens=0,
+            reasoning_tokens=40,
+        ),
+    )
+    text_but_uncounted = LLMCall(
+        index=0,
+        model="local:qwen3",
+        messages_appended=[Message(role="user", content="q")],
+        response_text="a",
+        reasoning_text="<think>weighing the two readings</think>",
+        usage=local_usage(input_tokens=10, output_tokens=50),
+    )
+
+    assert billed_but_hidden.reasoning_text is None
+    assert billed_but_hidden.usage.reasoning_tokens == 40
+    assert text_but_uncounted.reasoning_text is not None
+    assert text_but_uncounted.usage.reasoning_tokens is None
+
+
+def test_an_additive_field_does_not_orphan_the_golden_fixture() -> None:
+    """The rule `SCHEMA_VERSION` states, exercised on a live example.
+
+    `reasoning_text` is optional with a default, so the committed fixture —
+    written before it existed and carrying no such key — still validates and
+    still compares equal. That is what makes it additive, and why it must not
+    spend a schema version: a bump has to mean "this build cannot read that
+    file" or the signal is worthless.
+    """
+
+    payload = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    calls = [step for step in payload["steps"] if step["kind"] == "llm_call"]
+
+    assert calls
+    assert all("reasoning_text" not in call for call in calls)
+    assert all(
+        call.reasoning_text is None for call in load_trajectory(payload).llm_calls
+    )

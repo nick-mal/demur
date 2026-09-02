@@ -25,6 +25,7 @@ from demur.runner.dataset import (
     Resolution,
     Split,
 )
+from demur.sampling import Sampling
 from demur.trajectory import Trajectory
 
 
@@ -57,6 +58,7 @@ def manifest() -> RunManifest:
         prompt_version="p1",
         system_prompt_sha256="b" * 64,
         constraint_set_sha256="c" * 64,
+        sampling=Sampling(temperature=0),
         demur_version="0.1.1",
     )
 

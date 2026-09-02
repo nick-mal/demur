@@ -50,33 +50,79 @@ from demur.record import (
     Record,
     TokenCount,
 )
+from demur.sampling import Sampling
 
 SCHEMA_VERSION = "1"
-"""Bump when a change makes an older committed trajectory unreadable as-is."""
+"""Bump when a change makes an older committed trajectory unreadable as-is.
+
+Still 1: the schema has only ever had one *published* shape. Nothing is
+committed under `runs/`, so the breaking changes made while building it —
+`Usage.cache_creation_input_tokens` joining the set a reported usage must fill
+— rewrote the schema rather than versioning it, and the test fixture was
+regenerated to match.
+
+**That freedom expires at D-37**, the first committed run. From then on a
+trajectory on disk is evidence: a break costs a version and a converting
+loader in `_LOADERS`, never an edit to the file. The distinction to apply is
+whether an older record still validates — an optional field with a default is
+additive and must not spend a version, a field joining a required set is a
+break and must.
+"""
 
 
 class Usage(Record):
     """Token accounting for one LLM call.
+
+    **These are billing buckets, not physical facts about a cache.** Every
+    field here exists because some provider prices those tokens differently;
+    that is the only reason to split a prompt total at all. The distinction
+    matters for local models, where a server may well be reusing a KV cache
+    while `cached_input_tokens` reads `0` — which is correct, because nothing
+    was billed at a cache rate. `economics.py` reads these, and it prices
+    tokens; it does not audit inference engines.
 
     **`None` is not zero.** A provider that does not report a count leaves the
     field `None`; a provider that reports zero says zero. Collapsing the two
     would turn "we don't know what this cost" into "this was free", and the
     cost-per-accepted-outcome figure would quietly absorb the difference.
 
-    **Which fields overlap.** `input_tokens` and `cached_input_tokens` are
-    disjoint — a prompt token was either read from cache or it was not, and the
-    prompt total is their sum. `reasoning_tokens` is the exception: it is the
-    part of `output_tokens` the model spent thinking, reported for visibility
-    and already counted there, so adding it again double-counts.
+    **Which fields overlap.** The three prompt buckets — `input_tokens`,
+    `cached_input_tokens`, `cache_creation_input_tokens` — are mutually
+    disjoint, and the prompt total is their sum. `reasoning_tokens` is the
+    exception: it is the part of `output_tokens` the model spent thinking,
+    reported for visibility and already counted there, so adding it again
+    double-counts.
 
-    Providers disagree about that, and normalising is `providers.py`'s job, not
-    the reader's. Anthropic reports the prompt buckets separately, which maps
-    across directly. OpenAI-compatible providers — including demur's own fault
-    proxy — nest `cached_tokens` inside `prompt_tokens` and `reasoning_tokens`
-    inside `completion_tokens`, so an adapter must subtract the cached count
-    out rather than copy both fields across. An adapter for a provider with no
-    cache at all writes `cached_input_tokens=0`, which is the normalisation the
-    validator below insists on.
+    Providers disagree about all of this, and normalising is `providers.py`'s
+    job rather than the reader's:
+
+    - *Anthropic* reports the three prompt buckets separately and prices them
+      differently — cache reads at a large discount, cache **writes** at a
+      premium over ordinary input. All three map across directly.
+    - *OpenAI-compatible* providers, including demur's own fault proxy, nest
+      `cached_tokens` inside `prompt_tokens` and `reasoning_tokens` inside
+      `completion_tokens`, so an adapter must subtract the cached count out
+      rather than copy both fields across. They bill no cache-write premium,
+      so `cache_creation_input_tokens` is `0`.
+    - *Local servers* — Ollama, llama.cpp, vLLM behind an OpenAI-compatible
+      endpoint — report a prompt and a completion count and nothing else.
+      Both cache buckets are `0`: there is no cache *rate*, whatever the
+      engine does with its KV cache underneath. This is the case demur's own
+      quick start exercises, and the one where writing `0` is least
+      ambiguous.
+
+    An adapter that reports counts at all therefore writes `0` into every
+    bucket its provider has no price for, which is what the validator below
+    insists on.
+
+    **What is not checked, and cannot be.** That the three prompt buckets are
+    genuinely disjoint is an obligation on the adapter, not an invariant this
+    model can enforce: both the right answer and the double-counted one are
+    plausible non-negative integers. An OpenAI adapter that copies
+    `prompt_tokens` into `input_tokens` without subtracting `cached_tokens`
+    passes every check here and inflates the total on every call. The rule
+    below catches a *forgetful* adapter; only a per-adapter test against a real
+    response catches a *wrong* one, which is D-14's job.
 
     No cost field, by specification §4: cost is computed at reporting time from
     a versioned price table, so a run recorded in one month does not carry that
@@ -86,16 +132,42 @@ class Usage(Record):
 
     input_tokens: TokenCount | None = None
     output_tokens: TokenCount | None = None
+    # Prompt tokens served from cache, billed at a discount where a provider
+    # has one.
     cached_input_tokens: TokenCount | None = None
+    # Prompt tokens written *into* a cache, billed at a premium over ordinary
+    # input where a provider has one. Its own bucket rather than folded into
+    # `input_tokens` because the premium is what makes it worth recording: a
+    # run that populates a cache costs more than the same run reading one, and
+    # T2 — which adds few-shot exemplars, exactly the content worth caching —
+    # is where that difference lands hardest.
+    cache_creation_input_tokens: TokenCount | None = None
     reasoning_tokens: TokenCount | None = None
+
+    # Every bucket a normalised report must fill in. `reasoning_tokens` is
+    # absent deliberately: it is a subset of output rather than a bucket beside
+    # it, and Anthropic has no such field at all, so demanding it would reject
+    # a correct adapter.
+    _REQUIRED = (
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+    )
 
     @property
     def reported(self) -> bool:
         """Whether the provider said anything about this call at all.
 
-        Any field being set counts. Keying this on input or output alone would
-        let `Usage(cached_input_tokens=7)` through as "nothing reported", which
-        is the exact half-report the validator below exists to catch.
+        Any field being set counts, and that breadth exists for the validator
+        below rather than for callers: keying this on `input_tokens` alone
+        would let `Usage(cached_input_tokens=7)` through as "nothing reported",
+        which is the exact half-report the validator exists to catch.
+
+        Once validation has run the state space is only two wide — everything
+        `None`, or every required bucket filled — so on a constructed `Usage`
+        this is equivalent to `input_tokens is not None`. It is the *during*
+        validation reading that needs all five.
         """
 
         return any(
@@ -104,23 +176,30 @@ class Usage(Record):
                 self.input_tokens,
                 self.output_tokens,
                 self.cached_input_tokens,
+                self.cache_creation_input_tokens,
                 self.reasoning_tokens,
             )
         )
 
     @property
     def total_tokens(self) -> int | None:
-        """Prompt plus output, or `None` if the provider reported nothing.
+        """Every prompt bucket plus output, or `None` if nothing was reported.
 
-        Reasoning is inside `output_tokens` already and is not added again.
+        The three prompt buckets are disjoint, so they sum. Reasoning is inside
+        `output_tokens` already and is not added again. No defensive check for
+        a missing part: the validator guarantees that a reported `Usage` has
+        all four, so such a branch would be unreachable and would suggest the
+        schema is laxer than it is.
         """
 
         if not self.reported:
             return None
-        parts = (self.input_tokens, self.cached_input_tokens, self.output_tokens)
-        if any(part is None for part in parts):
-            return None
-        return sum(part for part in parts if part is not None)
+        return (
+            (self.input_tokens or 0)
+            + (self.cached_input_tokens or 0)
+            + (self.cache_creation_input_tokens or 0)
+            + (self.output_tokens or 0)
+        )
 
     @model_validator(mode="after")
     def check_reasoning_fits_inside_output(self) -> Self:
@@ -137,30 +216,27 @@ class Usage(Record):
 
     @model_validator(mode="after")
     def check_usage_is_all_or_nothing(self) -> Self:
-        """Reported usage must include the cache bucket.
+        """Reported usage must fill every billing bucket.
 
         Half-reported usage is the failure that costs nothing to create and
         everything to notice: cost accounting reads `total_tokens`, and an
-        adapter that forgot the cache bucket would make it `None` for every
-        call while every other field looked healthy. Either the provider said
-        nothing — all four `None` — or the adapter normalised it, which means
-        writing `0` where the provider has no cache.
+        adapter that forgot a bucket would silently drop those tokens from
+        every call while every other field looked healthy. Either the provider
+        said nothing — all fields `None` — or the adapter normalised it, which
+        means writing `0` for every bucket its provider has no price for. A
+        local model has no cache rates at all and writes `0` twice.
         """
 
         if not self.reported:
             return self
-        missing = [
-            name
-            for name in ("input_tokens", "output_tokens", "cached_input_tokens")
-            if getattr(self, name) is None
-        ]
+        missing = [name for name in self._REQUIRED if getattr(self, name) is None]
         if missing:
             raise ValueError(
                 f"usage reports some counts but leaves {', '.join(missing)} "
                 "unreported — normalise in the provider adapter and write 0 "
-                "where the provider has no such bucket. `None` means the "
-                "provider said nothing at all, and it must mean that for every "
-                "field or none of them."
+                "where the provider has no such bucket, as a local model has "
+                "no cache rates. `None` means the provider said nothing at "
+                "all, and it must mean that for every field or none of them."
             )
         return self
 
@@ -208,6 +284,11 @@ class Message(Record):
 
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
+    # Assistant turns only: what the model thought before answering. Carried
+    # here as well as on `LLMCall` so a prompt rebuilt by `prompt_at()` can be
+    # replayed — a provider continuing a turn that contained thinking expects
+    # the thinking back.
+    reasoning_text: str | None = None
     # Assistant turns only: the calls this turn asked for.
     tool_calls: tuple[ToolRequest, ...] = ()
     # Tool turns only: which `ToolRequest.call_id` this result answers.
@@ -217,11 +298,20 @@ class Message(Record):
     def check_shape_matches_role(self) -> Self:
         if self.role != "assistant" and self.tool_calls:
             raise ValueError(f"a {self.role} message cannot request tool calls")
+        if self.role != "assistant" and self.reasoning_text is not None:
+            raise ValueError(
+                f"a {self.role} message carries reasoning text — only the model "
+                "reasons, and attributing it to a user or a tool result would "
+                "put words in the wrong mouth on replay"
+            )
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError(
                 "a tool message must name the call it answers — an unattributed "
                 "result cannot be paired with the request that produced it"
             )
+        # Reasoning deliberately does not count here: thinking is what led to a
+        # turn, not a turn. A model that only thought and neither spoke nor
+        # called a tool has produced nothing to append to the conversation.
         if not (self.content or "").strip() and not self.tool_calls:
             raise ValueError(
                 f"a {self.role} message has neither content nor tool calls — "
@@ -250,11 +340,36 @@ class LLMCall(Record):
     model: NonEmptyStr
     messages_appended: tuple[Message, ...]
     response_text: str | None = None
+    # What the model thought on the way to that reply, where the provider
+    # returns it. Every provider reports this as a *sibling* to the content
+    # rather than inside it — `reasoning_content` on vLLM, `thinking` on Ollama,
+    # a `thinking` block alongside the text on Anthropic — so this is a field
+    # beside `response_text`, not a shape `content` has to grow.
+    #
+    # **`None` does not mean the model did not think**, and unlike `Usage` there
+    # is no validator tying it to `usage.reasoning_tokens`, because the two vary
+    # independently in both directions. Current Anthropic models bill thinking
+    # while returning no raw chain of thought at all — so tokens without text is
+    # the *normal* case, not a recording bug — and a local model behind vLLM
+    # returns the text while reporting no separate token count. A rule demanding
+    # both would reject two correct adapters.
+    #
+    # Recorded because it is evidence: `escalation_rationale_quality` judges why
+    # the agent handed off, and an abstention finding that could not show the
+    # reasoning behind an escalation would rest on the answer alone.
+    reasoning_text: str | None = None
     # What the model asked to call. Each request that reached the dispatcher
     # also appears as its own `ToolCall` step, paired on `call_id` — including
     # one the guard blocked and one whose arguments failed to parse.
     tool_calls_requested: tuple[ToolRequest, ...] = ()
     finish_reason: str | None = None
+    # What was actually sent for *this* call. `RunManifest.sampling` holds what
+    # the run was configured with; the two agree in an ordinary run, and where
+    # they differ — a retry at a higher temperature, a fault profile rewriting
+    # the request — the difference is the finding, not an inconsistency. Also
+    # what keeps a committed trajectory readable on its own: `prompt_at()` plus
+    # `model` plus this is the whole request, with no manifest needed.
+    sampling: Sampling = Field(default_factory=Sampling)
     usage: Usage = Field(default_factory=Usage)
     latency_ms: float | None = Field(default=None, ge=0)
     provider_request_id: str | None = None
@@ -265,7 +380,16 @@ class LLMCall(Record):
 
         Derived rather than stored, so a replay and the invalid-attempt count
         cannot read different things from the same step. `None` when the call
-        produced nothing — a provider error contributes no turn.
+        produced nothing — a provider error contributes no turn, and thinking
+        alone is not a turn either.
+
+        **Not byte-exact against every provider.** Anthropic's thinking blocks
+        carry a signature that continuing the same turn requires, and that
+        signature is a provider artifact this schema does not model — so a
+        rebuilt prompt reproduces what the model *said and thought*, not the
+        opaque token that proves it. Recorded as a known limit rather than
+        left to surface as a confusing 400 during `demur replay`; if D-14 finds
+        it load bearing, that is when it earns a field.
         """
 
         if not (self.response_text or "").strip() and not self.tool_calls_requested:
@@ -273,6 +397,7 @@ class LLMCall(Record):
         return Message(
             role="assistant",
             content=self.response_text,
+            reasoning_text=self.reasoning_text,
             tool_calls=self.tool_calls_requested,
         )
 

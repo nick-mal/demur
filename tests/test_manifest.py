@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from demur.manifest import RunManifest, Treatment
+from demur.sampling import Sampling
 
 DIGEST = "a" * 64
 
@@ -30,6 +31,7 @@ def manifest(**overrides: object) -> RunManifest:
         "system_prompt_sha256": "b" * 64,
         "constraint_set_sha256": "c" * 64,
         "demur_version": "0.1.0",
+        "sampling": Sampling(temperature=0, top_p=1, max_output_tokens=2048),
     }
     return RunManifest.model_validate(fields | overrides)
 
@@ -86,3 +88,43 @@ def test_repeats_must_be_at_least_one() -> None:
 def test_unknown_fields_are_rejected() -> None:
     with pytest.raises(ValidationError):
         manifest(dataset_hash=DIGEST)
+
+
+def test_a_run_that_did_not_pin_a_temperature_is_rejected() -> None:
+    """A run at "whatever the provider defaults to" is not a measurement.
+
+    Defaults move under stable model aliases, so such a run cannot be
+    reproduced even in principle — and when a later run differs, the artifacts
+    cannot say whether the candidate changed or the default did. That is the
+    one ambiguity a regression harness cannot tolerate, since resolving it is
+    the entire job.
+    """
+
+    with pytest.raises(ValidationError, match="records no temperature"):
+        manifest(sampling=Sampling(top_p=1))
+
+    assert manifest(sampling=Sampling(temperature=0)).sampling.temperature == 0
+
+
+def test_the_harness_seed_and_the_model_seed_are_different_fields() -> None:
+    """Two RNGs, and conflating them is how a run looks reproducible on paper
+    while the model still wanders. One orders instances and picks fault
+    profiles; the other is sent to the provider."""
+
+    pinned = manifest(seed=7, sampling=Sampling(temperature=0, seed=12345))
+
+    assert pinned.seed == 7
+    assert pinned.sampling.seed == 12345
+
+
+def test_sampling_is_part_of_what_makes_two_runs_comparable() -> None:
+    """A baseline sampled greedily and a candidate sampled at temperature 1 are
+    two different systems. `Baseline` is content-addressed over the manifest
+    fields that determine comparability, and this is one of them — so the two
+    manifests must be distinguishable, not merely differently behaved."""
+
+    greedy = manifest(sampling=Sampling(temperature=0))
+    exploratory = manifest(sampling=Sampling(temperature=1.0))
+
+    assert greedy.sampling != exploratory.sampling
+    assert greedy.model_dump_json() != exploratory.model_dump_json()
