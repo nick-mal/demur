@@ -35,10 +35,20 @@
         }
       ],
       "finish_reason": "tool_calls",
+      "sampling": {
+        "temperature": null,
+        "top_p": null,
+        "top_k": null,
+        "max_output_tokens": null,
+        "seed": null,
+        "stop": [],
+        "extra": {}
+      },
       "usage": {
         "input_tokens": 412,
         "output_tokens": 37,
         "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": 12
       },
       "latency_ms": 903.0,
@@ -86,10 +96,20 @@
         }
       ],
       "finish_reason": "tool_calls",
+      "sampling": {
+        "temperature": null,
+        "top_p": null,
+        "top_k": null,
+        "max_output_tokens": null,
+        "seed": null,
+        "stop": [],
+        "extra": {}
+      },
       "usage": {
         "input_tokens": 56,
         "output_tokens": 21,
         "cached_input_tokens": 412,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": null
       },
       "latency_ms": 611.0,
@@ -133,10 +153,20 @@
       "response_text": "June sales totalled 1,963.10.",
       "tool_calls_requested": [],
       "finish_reason": "stop",
+      "sampling": {
+        "temperature": null,
+        "top_p": null,
+        "top_k": null,
+        "max_output_tokens": null,
+        "seed": null,
+        "stop": [],
+        "extra": {}
+      },
       "usage": {
         "input_tokens": 64,
         "output_tokens": 18,
         "cached_input_tokens": 468,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": null
       },
       "latency_ms": 502.0,

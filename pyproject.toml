@@ -11,7 +11,8 @@ dependencies = [
     "fastapi",
     "numpy",
     "pytest",
-    "ruff"
+    "ruff",
+    "pyyaml>=6.0.3",
 ]
 
 [build-system]

@@ -7,9 +7,12 @@ claim rests on: if a reading can be enumerated without an authored answer,
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
+from demur.policy.constraints import ConstraintSet
 from demur.runner.dataset import (
     Expected,
     Instance,
@@ -18,7 +21,15 @@ from demur.runner.dataset import (
     ReferenceOutput,
     Resolution,
     Split,
+    check_constraints_cover_ambiguity,
     content_hash,
+)
+
+POLICY = (
+    Path(__file__).resolve().parents[1]
+    / "examples"
+    / "governed_warehouse"
+    / "constraints.yaml"
 )
 
 
@@ -211,3 +222,63 @@ def test_unknown_fields_are_rejected() -> None:
 
     with pytest.raises(ValidationError):
         Instance.model_validate(payload)
+
+
+def judged_against(*constraints: str) -> Instance:
+    """The canonical ambiguous case, judged against a chosen set of rules."""
+
+    return ambiguous_instance().model_copy(update={"constraints": constraints})
+
+
+def test_an_ambiguous_instance_must_select_an_abstention_rule() -> None:
+    """The quiet direction of the constraint-selection check.
+
+    `ConstraintSet.select` already refuses an id the policy does not define.
+    This is the failure that makes no noise: an instance enumerates two
+    readings, correctly expects escalation, forgets to list the rule that
+    checks for it, and then passes every constraint it did select. Nothing
+    fires and nothing is missing, so the case scores as full compliance while
+    testing nothing — and ambiguous instances *are* the abstention finding.
+    """
+
+    policy = ConstraintSet.from_path(POLICY)
+
+    with pytest.raises(ValueError, match="selects no abstention rule"):
+        check_constraints_cover_ambiguity(
+            judged_against("describe_before_query"), policy
+        )
+
+    check_constraints_cover_ambiguity(
+        judged_against("describe_before_query", "abstain_when_underdetermined"), policy
+    )
+
+
+def test_the_check_keys_on_the_rule_type_not_its_name() -> None:
+    """An id would put a string from the shipped policy into the library, and
+    renaming the rule in `constraints.yaml` would switch the check off without
+    a single test going red."""
+
+    renamed = ConstraintSet.from_yaml(
+        "version: v\n"
+        "constraints:\n"
+        "  - id: must_hand_off\n"
+        "    type: abstain_when_underdetermined\n"
+        "    description: escalate rather than guessing\n"
+        "    escalate_to: escalate\n"
+    )
+
+    check_constraints_cover_ambiguity(judged_against("must_hand_off"), renamed)
+
+    with pytest.raises(ValueError, match="must_hand_off"):
+        check_constraints_cover_ambiguity(judged_against(), renamed)
+
+
+def test_an_unambiguous_instance_may_carry_the_rule_or_not() -> None:
+    """Not the converse. A restricted-column or over-budget case escalates for
+    reasons unrelated to ambiguity, and answering it would be wrong for those
+    reasons too — so selecting the abstention rule is permitted, not required.
+    """
+
+    check_constraints_cover_ambiguity(
+        unambiguous_instance(), ConstraintSet.from_path(POLICY)
+    )

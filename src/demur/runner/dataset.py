@@ -18,6 +18,7 @@ from typing import Self
 
 from pydantic import Field, model_validator
 
+from demur.policy.constraints import AbstainWhenUnderdetermined, ConstraintSet
 from demur.record import (
     FrozenDict,
     FrozenJson,
@@ -212,6 +213,69 @@ class Instance(Record):
                 "the answer against"
             )
         return self
+
+
+def check_constraints_cover_ambiguity(
+    instance: Instance, policy: ConstraintSet
+) -> None:
+    """An ambiguous instance must be judged against an abstention rule.
+
+    `ConstraintSet.select` already guards the loud direction — an instance
+    naming a rule the policy does not define. This is the quiet one, and it is
+    the more dangerous: an instance that enumerates two readings, correctly
+    expects escalation, and simply forgets to list the rule that checks for it
+    passes every constraint it does select. Nothing fires, nothing is missing,
+    and the case scores as full compliance while testing nothing — which is
+    exactly the failure the abstention finding cannot afford, since ambiguous
+    instances are the finding.
+
+    Keyed on the rule **type**, never on an id: an id would put a string from
+    the shipped policy into the library, and renaming a rule in
+    `constraints.yaml` would silently switch this check off.
+
+    Not the converse. An unambiguous instance may carry the rule quite
+    legitimately — a restricted-column or over-budget case escalates for
+    reasons that have nothing to do with ambiguity, and answering it would be
+    wrong for those reasons too.
+
+    **Has no caller in `src/` yet, and that is a defect with a deadline.** It
+    belongs in D-20's dataset loader, which does not exist — until it does the
+    guard is opt-in, and anything assembling instances without calling it gets
+    no protection at all. When that loader lands it must be the only public
+    way to read a dataset, and it must call this; a check that has to be
+    remembered protects nothing, which is the same argument
+    `ConstraintSet.required_arguments` makes about the tool contract.
+
+    Raises rather than returning a report: a dataset that cannot be scored is
+    not a dataset to run against.
+    """
+
+    if not instance.is_ambiguous:
+        return
+
+    selected = set(instance.constraints)
+    available = tuple(
+        rule.id
+        for rule in policy.constraints
+        if isinstance(rule, AbstainWhenUnderdetermined)
+    )
+    if any(name in selected for name in available):
+        return
+
+    listed = ", ".join(repr(name) for name in instance.constraints) or "(none)"
+    remedy = (
+        f"Add {' or '.join(repr(name) for name in available)} to them."
+        if available
+        else (
+            f"Constraint set {policy.version!r} defines no abstention rule at "
+            "all, so it cannot judge an ambiguous case."
+        )
+    )
+    raise ValueError(
+        f"instance {instance.id!r} enumerates {len(instance.interpretations)} "
+        "defensible readings but selects no abstention rule, so nothing would "
+        f"check that it escalated: its constraints are {listed}. {remedy}"
+    )
 
 
 def content_hash(source: bytes) -> Sha256:
