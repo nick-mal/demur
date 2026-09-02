@@ -43,15 +43,15 @@ def hand_written_trajectory() -> Trajectory:
         final_answer=ANSWER,
         wall_ms=2342.5,
         provider_meta={"provider": "local", "alias": "qwen3"},
-        steps=[
+        steps=(
             LLMCall(
                 index=0,
                 model="local:qwen3",
-                messages_appended=[
+                messages_appended=(
                     Message(role="system", content="policy text"),
                     Message(role="user", content="total sales in June"),
-                ],
-                tool_calls_requested=[run_query],
+                ),
+                tool_calls_requested=(run_query,),
                 finish_reason="tool_calls",
                 usage=Usage(
                     input_tokens=412,
@@ -74,14 +74,14 @@ def hand_written_trajectory() -> Trajectory:
             LLMCall(
                 index=2,
                 model="local:qwen3",
-                messages_appended=[
+                messages_appended=(
                     Message(
                         role="tool",
                         content="blocked by describe_before_query",
                         tool_call_id="call-1",
                     ),
-                ],
-                tool_calls_requested=[describe],
+                ),
+                tool_calls_requested=(describe,),
                 finish_reason="tool_calls",
                 usage=Usage(
                     input_tokens=56,
@@ -106,13 +106,13 @@ def hand_written_trajectory() -> Trajectory:
             LLMCall(
                 index=4,
                 model="local:qwen3",
-                messages_appended=[
+                messages_appended=(
                     Message(
                         role="tool",
                         content='{"columns": ["id", "total"], "restricted": false}',
                         tool_call_id="call-2",
                     ),
-                ],
+                ),
                 response_text=ANSWER,
                 finish_reason="stop",
                 usage=Usage(
@@ -124,7 +124,7 @@ def hand_written_trajectory() -> Trajectory:
                 latency_ms=502.0,
                 provider_request_id="req-a3",
             ),
-        ],
+        ),
     )
 
 

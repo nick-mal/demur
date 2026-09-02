@@ -1,12 +1,12 @@
-"""The base class every demur record derives from, and the types they share.
+"""Base class and shared field types for every demur record.
 
-A record is a piece of committed evidence — a trajectory, a run manifest, an
-instance. The settings here are decisions rather than defaults, and they belong
-in one place because they have to hold for all of them.
+A record is committed evidence: a trajectory, a manifest, an instance. The
+settings here must hold for all of them, so they live in one place.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from typing import Annotated, Any, NoReturn, Self
 
@@ -22,39 +22,40 @@ from pydantic import (
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 """A lowercase hex SHA-256 digest.
 
-Content addressing is only worth anything if the addresses are well formed, and
-a truncated or upper-cased digest copied by hand would otherwise sit in a
-manifest looking plausible until a comparison silently failed to match.
+A truncated or upper-cased digest must fail here, not as a comparison that
+never matches.
 """
 
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1, strip_whitespace=True)]
-"""An identifier that has to actually identify something.
-
-A bare `str` accepts `""`, and an empty `run_id` becomes a `runs/` directory
-with no name — the kind of thing that surfaces as a confusing filesystem error
-hours into a run rather than as a validation failure at the start of it.
-"""
+"""An identifier that identifies something. An empty `run_id` is a nameless dir."""
 
 TokenCount = Annotated[int, Field(ge=0)]
-"""A non-negative token count. `None` elsewhere means *not reported*."""
+"""A non-negative token count. `None` elsewhere means not reported."""
+
+
+def sha256_hex(source: bytes) -> Sha256:
+    """Hash bytes as they sit on disk.
+
+    Identity is over source bytes, never the parsed model: a library change
+    must not rewrite the hash of data that did not change. See spec §4.
+    """
+
+    return hashlib.sha256(source).hexdigest()
 
 
 def _refuse(self: object, *_args: object, **_kwargs: object) -> NoReturn:
     raise TypeError(
-        f"{type(self).__name__} is immutable — this is part of a committed "
-        "record. Scorers derive values from a trajectory; they never annotate "
-        "it. Build a new object from the old one instead of editing in place."
+        f"{type(self).__name__} is immutable: scorers derive values from a record "
+        "and never annotate it. Build a new object instead of editing in place."
     )
 
 
 class FrozenList(list[Any]):
     """A list that refuses to change.
 
-    `frozen=True` on a pydantic model only blocks attribute assignment: the
-    list behind a field is still an ordinary list, and `traj.steps.append(...)`
-    would edit the record in place without tripping anything. Declared fields
-    use `tuple` instead; this exists for the sequences *inside* JSON values,
-    where the declared type has to stay list-shaped for serialisation.
+    `frozen=True` only blocks attribute assignment. Declared sequence fields
+    use `tuple`; this covers lists inside JSON values, which must stay
+    list-shaped to serialise.
     """
 
     __setitem__ = _refuse
@@ -85,16 +86,10 @@ class FrozenDict(dict[Any, Any]):
 
 
 def freeze(value: Any) -> Any:
-    """Recursively replace the containers in a JSON value with frozen ones.
+    """Replace the containers in a JSON value with frozen ones, at every depth.
 
-    Depth matters: a tool call's `arguments` can nest, and a guard that stops
-    at the top level would still let `arguments["filters"].append(...)` rewrite
-    what the agent did after the fact.
-
-    `FrozenList` and `FrozenDict` subclass `list` and `dict`, so pydantic
-    serialises them natively and they still compare equal to the plain
-    containers a JSON payload parses into — round trips and content hashes are
-    unaffected.
+    Both frozen types subclass the plain containers, so serialisation,
+    equality and content hashes are unaffected.
     """
 
     if isinstance(value, dict):
@@ -115,21 +110,11 @@ FrozenStrMap = Annotated[dict[str, str], AfterValidator(FrozenDict)]
 
 
 class Record(BaseModel):
-    """Immutable — genuinely, not just at the top level.
+    """Immutable at every depth and strict about fields. See spec §4.
 
-    This is the first of the two invariants in specification §4: trajectories
-    are immutable once written, and scorers derive values rather than annotate.
-    `frozen=True` blocks assignment to a field; the tuple and `Frozen*` types
-    above block the mutation *through* a field that assignment alone leaves
-    open. Both halves are needed — the second is the one that fails quietly.
-
-    `extra="forbid"`: records are read back months after they were written. A
-    field name that drifts has to fail loudly at load rather than be silently
-    dropped and take a metric with it.
-
-    Build records through validation. `model_copy(update=...)` is pydantic's
-    one route around every validator on this class, so it is overridden below
-    to re-validate rather than left as an unguarded back door.
+    `frozen=True` blocks assignment; the `Frozen*` types block mutation through
+    a field. `extra="forbid"` makes a drifted field name fail at load instead
+    of silently dropping a metric. `model_copy` re-validates, see below.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -137,14 +122,10 @@ class Record(BaseModel):
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
     ) -> Self:
-        """Copy with changes, re-validating the result.
+        """Copy with changes, re-validated.
 
-        Pydantic's own `model_copy` applies `update` without running a single
-        validator, which on these models means a copy can hold what the
-        original could never have been: a completed trajectory with no answer,
-        steps whose indices no longer match their positions, an ambiguous
-        instance expecting a confident answer. Every invariant here is load
-        bearing for a measurement, so the copy goes back through validation.
+        Pydantic's own `model_copy` skips every validator, so a copy could
+        hold what the original never could. Every invariant here is load bearing.
         """
 
         copied = super().model_copy(update=dict(update) if update else None, deep=deep)

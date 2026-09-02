@@ -11,15 +11,13 @@ or on the run as a whole.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import get_args
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from demur.policy.constraints import (
     AbstainWhenUnderdetermined,
-    Constraint,
-    ConstraintRule,
     ConstraintSet,
     Forbidden,
     Idempotent,
@@ -28,7 +26,6 @@ from demur.policy.constraints import (
     Threshold,
     UnknownConstraintError,
     ViolationKind,
-    _Rule,
 )
 from demur.trajectory import (
     LLMCall,
@@ -54,8 +51,8 @@ def tool_call(
     index: int,
     name: str,
     *,
-    arguments: dict | None = None,
-    result: object = None,
+    arguments: dict[str, Any] | None = None,
+    result: Any = None,
     status: OutcomeStatus = OutcomeStatus.OK,
     error: str | None = None,
     blocked_by: str | None = None,
@@ -78,7 +75,7 @@ def llm_call(
     return LLMCall(
         index=index,
         model="local:qwen3",
-        messages_appended=[Message(role="user", content="a question")],
+        messages_appended=(Message(role="user", content="a question"),),
         response_text=answer,
         tool_calls_requested=(
             (ToolRequest(call_id=f"req-{index}", name=asks),) if asks else ()
@@ -763,7 +760,8 @@ def test_selection_keeps_the_sets_own_order() -> None:
     chosen = policy.select(["escalate_terminates", "describe_before_query"])
 
     assert chosen.ids == ("describe_before_query", "escalate_terminates")
-    assert chosen.source_sha256 == policy.source_sha256
+    # The subset is not the file, so it does not claim the file's hash.
+    assert chosen.source_sha256 is None
 
 
 def test_the_type_tag_decides_which_rule_a_file_names() -> None:
@@ -853,7 +851,9 @@ def test_a_blocked_attempt_is_still_reported_as_a_violation() -> None:
 
     assert len(violations) == 1
     # The block is not duplicated onto the violation: it is read from the step.
-    assert traj.steps[violations[0].step_index].blocked
+    offending = traj.steps[violations[0].step_index]
+    assert isinstance(offending, ToolCall)
+    assert offending.blocked
 
 
 def test_asking_about_a_step_that_does_not_exist_says_how_to_ask() -> None:
@@ -867,28 +867,12 @@ def test_asking_about_a_step_that_does_not_exist_says_how_to_ask() -> None:
         ESCALATION_ENDS.check(traj, 1)
 
 
-def test_every_built_in_satisfies_the_constraint_protocol() -> None:
-    """Specification §5 promises `Constraint` as an extension point. The
-    built-ins have to be examples of it, or the protocol documents nothing."""
-
-    built_ins = (
-        DESCRIBE_FIRST,
-        Forbidden(id="f", description="d", tool="t"),
-        ESCALATION_ENDS,
-        ESCALATE_ONCE,
-        OVER_BUDGET,
-        ABSTAIN,
-    )
-
-    assert all(isinstance(rule, Constraint) for rule in built_ins)
-
-
 def test_every_built_in_has_its_own_failure_category() -> None:
     """The confusion table in specification §7 shows how failure modes migrate
     between runs. Two rule types sharing a label would merge two migrations
     into one column; a type with no label would vanish from the table."""
 
-    kinds = {
+    fired = (
         DESCRIBE_FIRST.check(
             run(tool_call(0, "run_query", arguments={"tables": ["orders"]})), 0
         ),
@@ -909,9 +893,9 @@ def test_every_built_in_has_its_own_failure_category() -> None:
         ),
         OVER_BUDGET.check(run(dry_run(0, 60_000_000), tool_call(1, "run_query")), 1),
         ABSTAIN.check(run(llm_call(0, answer="42")), 0),
-    }
+    )
 
-    assert {violation.kind for violation in kinds if violation} == set(ViolationKind)
+    assert {violation.kind for violation in fired if violation} == set(ViolationKind)
 
 
 # --- The tool contract this engine creates ----------------------------------
@@ -1027,26 +1011,33 @@ def test_renaming_a_result_key_silently_disarms_the_rule_that_reads_it() -> None
     assert "projected_scan_cost" in policy.required_result_fields["run_query"]
 
 
-def test_every_built_in_declares_both_halves_of_the_tool_contract() -> None:
-    """A seventh rule type that forgets an override would fail open alone.
+def test_every_built_in_publishes_both_halves_of_the_tool_contract() -> None:
+    """A rule type that publishes no contract fails open alone the moment a
+    tool drops a key. There is no default to inherit, so a type that forgot
+    an override fails here, at first use, rather than passing quietly."""
 
-    The base returns `()` for both, which is right for a rule that reads
-    neither — but it means a new type inheriting the default contributes
-    nothing to the contract, D-13's assertion passes, and that one rule
-    silently stops applying the moment a tool drops a key. Iterating the union
-    is cheaper than making the base abstract under pydantic, and it is the
-    module's own standard: a guard that has never fired is not known to work.
-    """
+    every_type = ConstraintSet(
+        version="v",
+        constraints=(
+            DESCRIBE_FIRST,
+            Forbidden(id="f", description="d", tool="t", when={"mode": "x"}),
+            ESCALATION_ENDS,
+            ESCALATE_ONCE,
+            OVER_BUDGET,
+            ABSTAIN,
+        ),
+    )
 
-    members = get_args(get_args(ConstraintRule)[0])
-    assert len(members) == 6
-
-    for member in members:
-        for method in ("argument_dependencies", "result_dependencies"):
-            assert getattr(member, method) is not getattr(_Rule, method), (
-                f"{member.__name__} inherits {method} from the base, so it "
-                "publishes no contract and fails open on its own"
-            )
+    assert every_type.required_arguments == {
+        "describe_schema": {"table"},
+        "run_query": {"tables"},
+        "t": {"mode"},
+        "escalate": {"case_id"},
+    }
+    assert every_type.required_result_fields == {
+        "describe_schema": set(),
+        "run_query": {"projected_scan_cost"},
+    }
 
 
 def test_the_published_contract_cannot_be_edited_by_its_reader() -> None:
@@ -1055,9 +1046,9 @@ def test_the_published_contract_cannot_be_edited_by_its_reader() -> None:
     policy = ConstraintSet.from_path(POLICY)
 
     with pytest.raises(TypeError):
-        policy.required_arguments["run_query"] = frozenset()
+        policy.required_arguments["run_query"] = frozenset()  # pyright: ignore[reportIndexIssue]
     with pytest.raises(TypeError):
-        policy.required_result_fields["run_query"] = frozenset()
+        policy.required_result_fields["run_query"] = frozenset()  # pyright: ignore[reportIndexIssue]
 
 
 def test_unqualified_column_names_launder_across_tables() -> None:

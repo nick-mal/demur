@@ -19,6 +19,8 @@ from demur.trajectory import (
     SCHEMA_VERSION,
     LLMCall,
     Message,
+    OutcomeStatus,
+    TerminalState,
     ToolCall,
     ToolOutcome,
     ToolRequest,
@@ -124,7 +126,7 @@ def test_a_blocked_call_must_name_the_constraint_that_blocked_it() -> None:
             index=0,
             name="run_query",
             call_id="call-1",
-            outcome=ToolOutcome(status="blocked"),
+            outcome=ToolOutcome(status=OutcomeStatus.BLOCKED),
         )
 
 
@@ -134,22 +136,22 @@ def test_a_call_that_ran_cannot_name_a_blocking_constraint() -> None:
             index=0,
             name="run_query",
             call_id="call-1",
-            outcome=ToolOutcome(status="ok", result=1),
+            outcome=ToolOutcome(status=OutcomeStatus.OK, result=1),
             blocked_by="describe_before_query",
         )
 
 
 def test_error_outcomes_carry_a_message_and_others_do_not() -> None:
     with pytest.raises(ValidationError, match="error message"):
-        ToolOutcome(status="error")
+        ToolOutcome(status=OutcomeStatus.ERROR)
 
     with pytest.raises(ValidationError, match="must not carry an error message"):
-        ToolOutcome(status="ok", error="boom")
+        ToolOutcome(status=OutcomeStatus.OK, error="boom")
 
 
 def test_a_blocked_outcome_has_no_result() -> None:
     with pytest.raises(ValidationError, match="the tool never ran"):
-        ToolOutcome(status="blocked", result={"rows": []})
+        ToolOutcome(status=OutcomeStatus.BLOCKED, result={"rows": []})
 
 
 def local_usage(*, input_tokens: int, output_tokens: int, **kw: int) -> Usage:
@@ -326,7 +328,7 @@ def test_a_call_that_produced_nothing_contributes_no_turn() -> None:
     call = LLMCall(
         index=0,
         model="local:qwen3",
-        messages_appended=[Message(role="user", content="hi")],
+        messages_appended=(Message(role="user", content="hi"),),
     )
 
     assert call.assistant_turn is None
@@ -339,14 +341,14 @@ def test_a_reply_stored_in_its_own_delta_is_rejected() -> None:
         LLMCall(
             index=0,
             model="local:qwen3",
-            messages_appended=[
+            messages_appended=(
                 Message(role="user", content="total sales in June"),
                 Message(
                     role="assistant",
-                    tool_calls=[ToolRequest(call_id="call-1", name="run_query")],
+                    tool_calls=(ToolRequest(call_id="call-1", name="run_query"),),
                 ),
-            ],
-            tool_calls_requested=[ToolRequest(call_id="call-1", name="run_query")],
+            ),
+            tool_calls_requested=(ToolRequest(call_id="call-1", name="run_query"),),
         )
 
 
@@ -400,7 +402,9 @@ def test_unparseable_arguments_are_recorded_rather_than_flattened() -> None:
         name="run_query",
         call_id="call-1",
         raw_arguments='{"sql": "SELECT',
-        outcome=ToolOutcome(status="error", error="invalid JSON in arguments"),
+        outcome=ToolOutcome(
+            status=OutcomeStatus.ERROR, error="invalid JSON in arguments"
+        ),
     )
 
     assert call.arguments == {}
@@ -415,7 +419,7 @@ def test_a_call_cannot_be_both_parsed_and_unparsed() -> None:
             call_id="call-1",
             arguments={"sql": "SELECT 1"},
             raw_arguments='{"sql": "SELECT',
-            outcome=ToolOutcome(status="error", error="invalid JSON"),
+            outcome=ToolOutcome(status=OutcomeStatus.ERROR, error="invalid JSON"),
         )
 
 
@@ -426,7 +430,7 @@ def test_a_call_the_dispatcher_could_not_read_cannot_have_succeeded() -> None:
             name="run_query",
             call_id="call-1",
             raw_arguments='{"sql": "SELECT',
-            outcome=ToolOutcome(status="ok", result={"rows": []}),
+            outcome=ToolOutcome(status=OutcomeStatus.OK, result={"rows": []}),
         )
 
 
@@ -435,7 +439,7 @@ def test_an_assistant_turn_can_carry_tool_calls_without_content() -> None:
 
     turn = Message(
         role="assistant",
-        tool_calls=[ToolRequest(call_id="call-1", name="run_query")],
+        tool_calls=(ToolRequest(call_id="call-1", name="run_query"),),
     )
 
     assert turn.content is None
@@ -454,7 +458,7 @@ def test_a_requested_call_must_be_pairable() -> None:
     """Both ends of the pairing are policed, not just the tool-result end."""
 
     with pytest.raises(ValidationError):
-        ToolRequest(name="run_query")
+        ToolRequest(name="run_query")  # pyright: ignore[reportCallIssue]
 
     with pytest.raises(ValidationError):
         ToolRequest(call_id="", name="run_query")
@@ -465,7 +469,7 @@ def test_only_assistants_request_tools_and_tool_results_name_their_call() -> Non
         Message(
             role="user",
             content="hi",
-            tool_calls=[ToolRequest(call_id="call-1", name="x")],
+            tool_calls=(ToolRequest(call_id="call-1", name="x"),),
         )
 
     with pytest.raises(ValidationError, match="must name the call it answers"):
@@ -487,12 +491,14 @@ def test_a_run_that_did_nothing_cannot_have_completed_or_escalated() -> None:
         Trajectory(
             run_id="run-1",
             instance_id="rs-014",
-            terminal_state="completed",
+            terminal_state=TerminalState.COMPLETED,
             final_answer="anything",
         )
 
     with pytest.raises(ValidationError, match="the agent did nothing"):
-        Trajectory(run_id="run-1", instance_id="rs-014", terminal_state="escalated")
+        Trajectory(
+            run_id="run-1", instance_id="rs-014", terminal_state=TerminalState.ESCALATED
+        )
 
 
 def test_only_a_completed_run_carries_a_final_answer(trajectory: Trajectory) -> None:
@@ -522,21 +528,16 @@ def test_identifiers_must_identify_something() -> None:
     """An empty run_id becomes a `runs/` directory with no name."""
 
     with pytest.raises(ValidationError):
-        Trajectory(run_id="", instance_id="rs-014", terminal_state="provider_error")
+        Trajectory(
+            run_id="", instance_id="rs-014", terminal_state=TerminalState.PROVIDER_ERROR
+        )
 
     with pytest.raises(ValidationError):
-        Trajectory(run_id="run-1", instance_id="  ", terminal_state="provider_error")
-
-
-def test_prefix_is_what_a_constraint_sees(trajectory: Trajectory) -> None:
-
-    assert trajectory.prefix(0) == ()
-    assert len(trajectory.prefix(2)) == 2
-    assert trajectory.prefix(2)[-1].name == "run_query"
-    assert len(trajectory.prefix(99)) == len(trajectory.steps)
-
-    with pytest.raises(IndexError):
-        trajectory.prefix(-1)
+        Trajectory(
+            run_id="run-1",
+            instance_id="  ",
+            terminal_state=TerminalState.PROVIDER_ERROR,
+        )
 
 
 def test_trajectories_are_immutable(trajectory: Trajectory) -> None:
@@ -567,7 +568,7 @@ def test_a_call_records_the_parameters_it_was_actually_sent_with() -> None:
     call = LLMCall(
         index=0,
         model="local:qwen3",
-        messages_appended=[Message(role="user", content="total sales in June")],
+        messages_appended=(Message(role="user", content="total sales in June"),),
         response_text="1,963.10",
         sampling=Sampling(temperature=0.7, top_p=0.95, seed=11, stop=("\n\n",)),
     )
@@ -616,7 +617,7 @@ def test_reasoning_survives_into_a_rebuilt_prompt() -> None:
     call = LLMCall(
         index=0,
         model="local:qwen3",
-        messages_appended=[Message(role="user", content="total sales in June")],
+        messages_appended=(Message(role="user", content="total sales in June"),),
         reasoning_text="Two date columns could anchor 'June'. Neither is named.",
         response_text="Which date should I anchor on?",
     )
@@ -639,7 +640,7 @@ def test_thinking_alone_is_not_a_turn() -> None:
     call = LLMCall(
         index=0,
         model="local:qwen3",
-        messages_appended=[Message(role="user", content="hello")],
+        messages_appended=(Message(role="user", content="hello"),),
         reasoning_text="thinking about it",
     )
 
@@ -677,7 +678,7 @@ def test_reasoning_tokens_without_text_is_the_normal_case() -> None:
     billed_but_hidden = LLMCall(
         index=0,
         model="claude-opus-5",
-        messages_appended=[Message(role="user", content="q")],
+        messages_appended=(Message(role="user", content="q"),),
         response_text="a",
         usage=Usage(
             input_tokens=10,
@@ -690,7 +691,7 @@ def test_reasoning_tokens_without_text_is_the_normal_case() -> None:
     text_but_uncounted = LLMCall(
         index=0,
         model="local:qwen3",
-        messages_appended=[Message(role="user", content="q")],
+        messages_appended=(Message(role="user", content="q"),),
         response_text="a",
         reasoning_text="<think>weighing the two readings</think>",
         usage=local_usage(input_tokens=10, output_tokens=50),

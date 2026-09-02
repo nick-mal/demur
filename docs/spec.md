@@ -33,7 +33,7 @@ demur compare --baseline runs/baseline-v1 --candidate runs/latest
 make reproduce-published-results
 ```
 
-Requires Python 3.12+ and Docker. Tested on macOS (arm64) and Linux (x86-64).
+Requires Python 3.13+ and Docker. Tested on macOS (arm64) and Linux (x86-64).
 
 ## 3. Architecture
 
@@ -69,15 +69,15 @@ demur/
     tools/                      describe_schema, check_access, run_query, escalate
     warehouse/                  seed data, access matrix, build script
     prompts/                    versioned prompt templates
-    constraints.yaml            the six policy rules as data
+    constraints.yaml            the six policy rules, as eight constraints
     dataset/                    instances, splits, hashes
     scorers/                    domain scorers
     api/                        FastAPI POST /ask
     tolerances.yaml             per-metric regression bands
+    runs/                       committed raw trajectories and scorer outputs
 
-  runs/                         committed raw trajectories and scorer outputs
   tests/
-  docs/                         methodology, provenance, validity
+  docs/                         spec, architecture, build plan, provenance, methodology, validity
 ```
 
 **Boundary rule, enforced in CI.** Nothing under `src/demur/` may import from `examples/`. `tests/test_boundary.py` walks the AST of every library module and fails on violation, including relative-import escapes. If the library appears to need something from the example, the abstraction is wrong: lift the concept into the library rather than importing the specimen. The dependency runs one direction only.
@@ -90,13 +90,14 @@ The two prompt hashes are how the experimental control is *proved* rather than a
 
 `seed` here is the **harness** seed — instance ordering, fault-profile selection, stochastic scorers. The provider's sampling seed is `sampling.seed`. Two different RNGs, and conflating them is how a run looks reproducible on paper while the model still wanders.
 
-**`Instance`** — one evaluation case. `id` · `request` · `fixture_state` · `constraints` (a partial order, not a golden path) · `expected` (resolution class) · `interpretations` (list; length > 1 marks the case ambiguous) · `reference_outputs` (one per interpretation) · `split` (`dev` | `test`) · `origin` (`authored` | `drafted`). Content-addressed over its **source bytes on disk**, never over the parsed model: hashing the model would fold the library's own shape into dataset identity, so adding a defaulted field would rewrite every instance hash and invalidate committed baselines while nothing about the data had changed. Two invariants are enforced at load: an instance with more than one interpretation must expect escalation, since that is what ambiguity *means*; and one expected to be answered must enumerate at least one reading, or there is no reference output to score against.
+**`Instance`** — one evaluation case. `id` · `request` · `fixture_state` · `constraints` (a partial order, not a golden path) · `expected` (resolution class) · `interpretations` (list, each carrying its own `reference_output`; length > 1 marks the case ambiguous) · `split` (`dev` | `test`) · `origin` (`authored` | `drafted`). Content-addressed over its **source bytes on disk**, never over the parsed model: hashing the model would fold the library's own shape into dataset identity, so adding a defaulted field would rewrite every instance hash and invalidate committed baselines while nothing about the data had changed. Two invariants are enforced at load: an instance with more than one interpretation must expect escalation, since that is what ambiguity *means*; and one expected to be answered must enumerate at least one reading, or there is no reference output to score against.
 
 **`Trajectory`** — one agent run against one instance. `schema_version` · `run_id` · `instance_id` · `repeat_index` · `steps[]` · `wall_ms` · `terminal_state` · `final_answer` · `provider_meta`. Run-level identity lives on the manifest, not here. `final_answer` is present exactly when the run `completed`: a run that escalated, exhausted its steps, or failed stopped without answering, and whatever the model said last is in that step's `response_text` rather than promoted to the run's answer.
 
 **`Step`** — a discriminated union on `kind`, so the loader dispatches rather than guessing.
 
-- `LLMCall` — `index` · `model` · `messages_appended` · `response_text` · `reasoning_text` · `tool_calls_requested` · `finish_reason` · `sampling` · `usage` · `latency_ms` · `provider_request_id`
+- `Completion` — `model` · `response_text` · `reasoning_text` · `tool_calls_requested` · `finish_reason` · `sampling` · `usage` · `latency_ms` · `provider_request_id`. What a provider returned, and nothing about where in the run it sits. This is what `Provider.complete()` returns (§5).
+- `LLMCall` — a `Completion` plus `index` · `messages_appended`. The agent loop builds it from the provider's reply and the delta that preceded the call.
 - `ToolCall` — `index` · `name` · `arguments` · `raw_arguments` · `outcome` · `blocked_by` · `call_id` · `latency_ms`
 - `ToolRequest` — `call_id` · `name` · `arguments` · `raw_arguments`. What the model asked for, before dispatch. `call_id` is required on both the request and the dispatch — a provider that emits none leaves the adapter to synthesise one — because a call that cannot be paired is not evidence of intent. Requests pair with their `ToolCall` on `call_id`: the invalid-attempt rate is model intent and has to be measurable whether or not the guard let the call through. `raw_arguments` holds argument text that failed to parse — fault profile 3 — which would otherwise flatten into an empty `arguments` and lose the evidence.
 
@@ -134,7 +135,7 @@ classDiagram
 
     note "Every class here derives from Record (record.py):
     frozen, extra forbid, model_copy re-validates.
-    Inheritance edges are omitted so the arrows below
+    That inheritance is omitted so the arrows below
     show structure rather than boilerplate."
 
     class Instance {
@@ -151,10 +152,7 @@ classDiagram
     class Interpretation {
         id
         description
-    }
-    class ReferenceOutput {
-        interpretation_id
-        payload
+        reference_output
     }
     class RunManifest {
         run_id, started_at
@@ -178,16 +176,18 @@ classDiagram
         prompt_at(i)
         ends_with_tool(name)
     }
-    class LLMCall {
-        index, model
-        messages_appended
+    class Completion {
+        model
         response_text
         reasoning_text
         finish_reason
-        sampling
         latency_ms
         provider_request_id
         assistant_turn
+    }
+    class LLMCall {
+        index
+        messages_appended
     }
     class ToolCall {
         index, name
@@ -262,21 +262,20 @@ classDiagram
 
     Instance *-- Expected
     Instance *-- Interpretation
-    Instance *-- ReferenceOutput
     Instance --> Split
     Instance --> Origin
     Expected --> Resolution
-    Interpretation <.. ReferenceOutput : one per reading
 
     RunManifest --> Treatment
 
     Trajectory *-- LLMCall : steps
     Trajectory *-- ToolCall : steps
     Trajectory --> TerminalState
+    Completion <|-- LLMCall
     LLMCall *-- Message : messages_appended
-    LLMCall *-- ToolRequest : tool_calls_requested
-    LLMCall *-- Usage
-    LLMCall *-- Sampling
+    Completion *-- ToolRequest : tool_calls_requested
+    Completion *-- Usage
+    Completion *-- Sampling
     RunManifest *-- Sampling
     Message *-- ToolRequest : tool_calls
     ToolCall *-- ToolOutcome
@@ -308,14 +307,8 @@ class Tool(Protocol):
     def call(self, args: dict, fixtures: Any) -> ToolOutcome: ...
 
 
-class Constraint(Protocol):
-    id: str
-
-    def check(self, traj: Trajectory, upto: int) -> Violation | None: ...
-
-
 class Provider(Protocol):
-    def complete(self, messages, tools, **kw) -> LLMCall: ...
+    def complete(self, messages, tools, sampling) -> Completion: ...
 
 
 class AcceptancePredicate(Protocol):
@@ -323,6 +316,8 @@ class AcceptancePredicate(Protocol):
 ```
 
 `AcceptancePredicate` keeps cost accounting domain-blind: the library computes cost per accepted outcome, the domain decides what accepted means.
+
+`Provider.complete()` returns a `Completion`, not an `LLMCall`. The step index and the prompt delta are the agent loop's facts, and a provider that had to know them would be entangled with the loop. There is no `Constraint` protocol: the six built-in types are a closed set (§15), and a rule they cannot state is a seventh type argued on its merits, not an object handed in from outside.
 
 **Built-in constraint types**, sufficient for the shipped example and reusable beyond it. Six, fixed. Every field is a tool name, an argument name, a literal value or a number — there is no expression language and no predicate syntax, because a configuration DSL is a non-goal (§15). A policy the six cannot state gets a seventh type argued on its merits, not an escape hatch.
 
@@ -343,7 +338,7 @@ Both directions of that selection are checked, because both fail silently. `Cons
 
 **`Violation`** — `constraint_id` · `kind` · `step_index` · `detail`. `kind` is one label per constraint *type*, not per rule, so the failure-category confusion table (§7) keeps fixed columns while a policy gains or renames rules. There is no `blocked` field: whether the guard stopped the offending call is `traj.steps[step_index].blocked`, and storing it twice would let a replay and the enforcement metrics disagree about the same step.
 
-**`ConstraintSet`** — `version` · `constraints` · `source_sha256`, loaded from YAML. The hash is over the file's bytes for the same reason instance hashes are, and it is what the manifest records as `constraint_set_sha256`.
+**`ConstraintSet`** — `version` · `constraints` · `source_sha256`, loaded from YAML. The hash is over the file's bytes for the same reason instance hashes are, and it is what the manifest records as `constraint_set_sha256`. A subset returned by `select` carries no hash: it is not the file.
 
 ## 6. Execution semantics
 
@@ -407,7 +402,7 @@ An agent answering analytical questions against a governed data warehouse. Four 
 
 **Two contracts the constraint engine places on these tools.** Rules compare literal values in recorded arguments; anything the tools do not encode, the policy cannot see.
 
-1. *Every argument the policy reads is recorded on every call*, defaults filled in and derived values included, never left absent. A rule cannot notice a key that is not there, and an omitted one means the rule is **skipped rather than failed** — a `run_query` recorded with only `sql` draws zero violations from all six rules. `ConstraintSet.required_arguments` publishes the list so the tool schemas are asserted against it rather than kept in step by memory. This does not blur what the model asked for: verbatim intent is the `ToolRequest` on the preceding `LLMCall`, the `ToolCall` is the dispatch, `call_id` pairs them, and the policy judges the dispatch.
+1. *Every argument the policy reads is recorded on every call*, defaults filled in and derived values included, never left absent. A rule cannot notice a key that is not there, and an omitted one means the rule is **skipped rather than failed** — a `run_query` recorded with only `sql` draws zero violations from every rule. `ConstraintSet.required_arguments` publishes the list so the tool schemas are asserted against it rather than kept in step by memory. This does not blur what the model asked for: verbatim intent is the `ToolRequest` on the preceding `LLMCall`, the `ToolCall` is the dispatch, `call_id` pairs them, and the policy judges the dispatch.
 2. *Every result key the policy reads is returned under that name.* `ConstraintSet.required_result_fields` publishes them (`run_query.projected_scan_cost`, `check_access.allowed`). The more dangerous half, because the two result-reading rules fail in opposite directions: a renamed key under `satisfied_when` blocks every query loudly, while a renamed key under `Threshold` means no breach is ever detected and the over-budget cases score clean. A value present but not numeric — a cost returned as a JSON string, a flag where a number belongs — raises rather than being skipped: a ceiling that cannot read its own measurement enforces nothing, and a run that stops is recoverable where a measurement that quietly stopped measuring is not. Absent or null means the rule does not apply, which is ordinary.
 3. *Table and column names are fully qualified* — `hr.employees`, `hr.employees.salary`. Fifteen tables across three unrelated schemas make same-named columns ordinary, and bare names would let a passing `check_access` on one table clear a same-named column on another. Nothing in rule 2 ties a cleared column back to the table it was cleared on, and adding that would mean teaching the library that columns live in tables.
 

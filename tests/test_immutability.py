@@ -1,11 +1,9 @@
 """A record must be immutable all the way down, not just at the top.
 
-`frozen=True` stops `traj.instance_id = ...` and nothing else. The list behind
-a field is an ordinary list unless something makes it otherwise, so the
-mutations that would actually happen by accident — a scorer stashing a value in
-`provider_meta`, a helper appending a step, a retry rewriting `arguments` —
-all went through while the model still looked frozen. These tests are the
-executable half of specification §4's first invariant.
+`frozen=True` stops `traj.instance_id = ...` and nothing else. The mutations
+that happen by accident go through a field: a scorer stashing a value in
+`provider_meta`, a helper appending a step, a retry rewriting `arguments`.
+These tests are the executable half of specification §4's first invariant.
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ from demur.runner.dataset import (
     Instance,
     Interpretation,
     Origin,
-    ReferenceOutput,
     Resolution,
     Split,
 )
@@ -34,12 +31,15 @@ def instance() -> Instance:
         id="rs-042",
         request="What were sales in June?",
         fixture_state={"schema": "regional_sales", "seeded": [1, {"rows": 2}]},
-        constraints=["describe_before_query"],
+        constraints=("describe_before_query",),
         expected=Expected(resolution=Resolution.ESCALATE, reason="four date columns"),
-        interpretations=[Interpretation(id="order_date", description="on OrderDate")],
-        reference_outputs=[
-            ReferenceOutput(interpretation_id="order_date", payload={"rows": [[1]]})
-        ],
+        interpretations=(
+            Interpretation(
+                id="order_date",
+                description="on OrderDate",
+                reference_output={"rows": [[1]]},
+            ),
+        ),
         split=Split.TEST,
         origin=Origin.DRAFTED,
     )
@@ -64,13 +64,17 @@ def manifest() -> RunManifest:
 
 
 def test_the_step_list_cannot_be_grown_or_shortened(trajectory: Trajectory) -> None:
-    """The four holes that `frozen=True` alone left open."""
+    """Declared sequences are tuples, so the list API is simply absent."""
 
-    with pytest.raises(AttributeError):
-        trajectory.steps.append(trajectory.steps[0])  # type: ignore[attr-defined]
+    steps = trajectory.steps
+
+    assert isinstance(steps, tuple)
+    with pytest.raises(AttributeError, match="'tuple' object has no attribute"):
+        steps.append(steps[0])  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_provider_meta_cannot_be_annotated(trajectory: Trajectory) -> None:
+    """The mutation a scorer would make by accident."""
 
     with pytest.raises(TypeError, match="never annotate"):
         trajectory.provider_meta["annotated_by"] = "scorer"
@@ -88,10 +92,11 @@ def test_tool_arguments_cannot_be_rewritten(trajectory: Trajectory) -> None:
 def test_the_prompt_cannot_be_edited(trajectory: Trajectory) -> None:
     """The prompt is the experimental manipulation, so it is part of the record."""
 
-    llm_call = trajectory.llm_calls[0]
+    messages = trajectory.llm_calls[0].messages_appended
 
-    with pytest.raises(AttributeError):
-        llm_call.request_messages.clear()  # type: ignore[attr-defined]
+    assert isinstance(messages, tuple)
+    with pytest.raises(AttributeError, match="'tuple' object has no attribute"):
+        messages.clear()  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_nested_json_is_frozen_at_every_level(trajectory: Trajectory) -> None:
@@ -123,17 +128,23 @@ def test_instances_are_frozen_all_the_way_down() -> None:
     case = instance()
 
     with pytest.raises(AttributeError):
-        case.interpretations.append(  # type: ignore[attr-defined]
+        case.interpretations.append(  # pyright: ignore[reportAttributeAccessIssue]
             Interpretation(id="ship_date", description="on ShipDate")
         )
+    seeded = case.fixture_state["seeded"]
+    assert isinstance(seeded, list)
+    assert isinstance(seeded[1], dict)
     with pytest.raises(TypeError):
-        case.fixture_state["seeded"][1]["rows"] = 3
+        seeded[1]["rows"] = 3
+
+    output = case.interpretations[0].reference_output
+    assert isinstance(output, dict)
     with pytest.raises(TypeError):
-        case.reference_outputs[0].payload["rows"] = []
+        output["rows"] = []
 
 
 def test_manifest_scorer_versions_cannot_be_edited() -> None:
-    """A version change invalidates baselines — it must not be editable in place."""
+    """A version change invalidates baselines; it must not be editable in place."""
 
     with pytest.raises(TypeError):
         manifest().scorer_versions["result_correct"] = "9.9.9"
@@ -142,10 +153,8 @@ def test_manifest_scorer_versions_cannot_be_edited() -> None:
 def test_frozen_containers_still_compare_equal_to_plain_ones(
     trajectory: Trajectory,
 ) -> None:
-    """Freezing must not change what a record *is*, only what can be done to it.
-
-    Round-trip equality and content hashing both rest on this.
-    """
+    """Freezing must not change what a record is, only what can be done to it.
+    Round-trip equality and content hashing both rest on this."""
 
     assert trajectory.provider_meta == {"provider": "local", "alias": "qwen3"}
     assert trajectory.tool_calls[1].arguments == {"table": "orders"}
