@@ -31,12 +31,15 @@ from demur.record import (
     Sha256,
     sha256_hex,
 )
-from demur.trajectory import LLMCall, OutcomeStatus, Step, ToolCall, Trajectory
+from demur.trajectory import LLMCall, ToolCall, Trajectory
 
 
 class ViolationKind(StrEnum):
-    """One kind per constraint type, not per rule, so the failure-category
-    confusion table keeps fixed columns while a policy renames rules."""
+    """The failure category a violation carries.
+
+    One kind per constraint type, not per rule, so the failure-category
+    confusion table keeps fixed columns while a policy renames rules.
+    """
 
     MISSING_PREREQUISITE = "missing_prerequisite"
     FORBIDDEN_CALL = "forbidden_call"
@@ -65,15 +68,22 @@ Dependencies = tuple[tuple[str, frozenset[str]], ...]
 
 
 def _literal(value: Any) -> str:
-    """A JSON value as a type-distinguishing string, so `1` and `"1"` differ."""
+    """Serialise a JSON value to a type-distinguishing string.
+
+    So `1` and `"1"` do not compare equal: a table name and a row count must
+    never satisfy each other's prerequisite.
+    """
 
     return json.dumps(value, sort_keys=True)
 
 
 def _key_values(source: Mapping[str, Any], key: str) -> frozenset[str]:
-    """The value or values at `key`, as a set. A scalar and a list both become
-    sets, so one rule can relate `table` to `tables`. A missing key yields the
-    empty set: it satisfies nothing and requires nothing."""
+    """Return the value or values at `key` as a set of literals.
+
+    A scalar and a list both become sets, so one rule can relate `table` to
+    `tables`. A missing key yields the empty set: it satisfies nothing and
+    requires nothing.
+    """
 
     if key not in source:
         return frozenset()
@@ -83,8 +93,11 @@ def _key_values(source: Mapping[str, Any], key: str) -> frozenset[str]:
 
 
 def _matches(source: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
-    """Partial match: every key in `expected` is present in `source` with an
-    equal literal. A missing key never matches, so the rule is skipped."""
+    """Return whether `source` has every key in `expected` with an equal literal.
+
+    A partial match, so a tool may grow optional arguments. A missing key
+    never matches, so the rule is skipped rather than satisfied.
+    """
 
     return all(
         key in source and _literal(source[key]) == _literal(value)
@@ -93,7 +106,7 @@ def _matches(source: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
 
 
 def _number(value: float) -> str:
-    """A measurement as a reader would write it, never in exponent notation."""
+    """Format a measurement as a reader would write it, never in exponent form."""
 
     if not math.isfinite(value):
         return str(value)
@@ -102,57 +115,30 @@ def _number(value: float) -> str:
     return f"{value:g}"
 
 
-def _result_object(call: ToolCall) -> Mapping[str, Any]:
-    """A tool result as an object, or empty if it is not object-shaped."""
-
-    return call.outcome.result if isinstance(call.outcome.result, Mapping) else {}
-
-
 class _Rule(Record):
-    """What the six built-ins share: an id and a sentence.
+    """Base of the six built-in rule types: an id and a sentence.
 
-    `description` is rendered into the T1 prompt, so it is authored beside the
-    check it describes and a drift between them shows in one diff. Subclasses
-    publish the arguments and result keys they read. There is no default: a
-    type that forgets fails at first use rather than failing open.
+    Each subclass implements `check(traj, upto)`, returning a `Violation` if
+    the step at `upto` breaks the rule, and publishes the argument and result
+    keys it reads. `description` is rendered into the T1 prompt, so it is
+    authored beside the check and a drift between them shows in one diff.
     """
 
     id: NonEmptyStr
     description: NonEmptyStr
 
-    def _subject(self, traj: Trajectory, upto: int) -> Step:
-        if upto < 0 or upto >= len(traj.steps):
-            raise IndexError(
-                f"no step at index {upto}: the trajectory has {len(traj.steps)} "
-                "steps. To ask about a call before making it, append it and ask "
-                "about its index."
-            )
-        return traj.steps[upto]
-
     def _subject_tool_call(
         self, traj: Trajectory, upto: int, name: str
     ) -> ToolCall | None:
-        """The step at `upto` if it calls `name`, else `None`. Its outcome is
-        not consulted: a blocked attempt is still an attempt."""
+        """Return the step at `upto` if it is a call to `name`, else `None`.
 
-        step = self._subject(traj, upto)
+        Its outcome is not consulted: a blocked attempt is still an attempt.
+        """
+
+        step = traj.step_at(upto)
         if isinstance(step, ToolCall) and step.name == name:
             return step
         return None
-
-    def _successful_earlier_calls(
-        self, traj: Trajectory, upto: int, name: str
-    ) -> tuple[ToolCall, ...]:
-        """Earlier calls to `name` that ran and succeeded. A blocked or failed
-        call did nothing, so it unlocks nothing."""
-
-        return tuple(
-            step
-            for step in traj.steps[:upto]
-            if isinstance(step, ToolCall)
-            and step.name == name
-            and step.outcome.status is OutcomeStatus.OK
-        )
 
 
 class RequiresBefore(_Rule):
@@ -176,8 +162,11 @@ class RequiresBefore(_Rule):
 
     @model_validator(mode="after")
     def check_keys_are_declared_in_pairs(self) -> Self:
-        """`later_key` alone rejects every call; `earlier_key` alone reduces
-        to a bare ordering rule. Both read as a working rule in YAML."""
+        """Reject `earlier_key` without `later_key`, or the reverse.
+
+        `later_key` alone rejects every call; `earlier_key` alone reduces to a
+        bare ordering rule. Both read as a working rule in YAML.
+        """
 
         if (self.earlier_key is None) != (self.later_key is None):
             raise ValueError(
@@ -194,10 +183,10 @@ class RequiresBefore(_Rule):
 
         satisfied: set[str] = set()
         seen = False
-        for earlier in self._successful_earlier_calls(traj, upto, self.earlier):
+        for earlier in traj.successful_calls_before(upto, self.earlier):
             if not _matches(earlier.arguments, self.earlier_when):
                 continue
-            if not _matches(_result_object(earlier), self.satisfied_when):
+            if not _matches(earlier.result_fields, self.satisfied_when):
                 continue
             seen = True
             if self.earlier_key is not None:
@@ -291,8 +280,8 @@ class Terminal(_Rule):
 
     def check(self, traj: Trajectory, upto: int) -> Violation | None:
         # Bounds check only: every kind of step after the handoff is judged.
-        self._subject(traj, upto)
-        closed = self._successful_earlier_calls(traj, upto, self.tool)
+        traj.step_at(upto)
+        closed = traj.successful_calls_before(upto, self.tool)
         if not closed:
             return None
         return Violation(
@@ -331,7 +320,7 @@ class Idempotent(_Rule):
         values = _key_values(subject.arguments, self.key)
         if not values:
             return None
-        for earlier in self._successful_earlier_calls(traj, upto, self.tool):
+        for earlier in traj.successful_calls_before(upto, self.tool):
             repeated = _key_values(earlier.arguments, self.key) & values
             if repeated:
                 return Violation(
@@ -368,22 +357,18 @@ class Threshold(_Rule):
     else_action: NonEmptyStr
 
     def check(self, traj: Trajectory, upto: int) -> Violation | None:
-        step = self._subject(traj, upto)
+        step = traj.step_at(upto)
         if not isinstance(step, ToolCall) or step.name == self.else_action:
             return None
 
         breach: tuple[ToolCall, float] | None = None
-        for earlier in traj.steps[:upto]:
-            if not isinstance(earlier, ToolCall):
-                continue
-            if earlier.outcome.status is not OutcomeStatus.OK:
-                continue
+        for earlier in traj.successful_calls_before(upto):
             if earlier.name == self.else_action:
                 breach = None
                 continue
             if earlier.name != self.tool:
                 continue
-            value = _result_object(earlier).get(self.field)
+            value = earlier.result_fields.get(self.field)
             # Absent or null means the rule does not apply: only a dry run
             # carries an estimate.
             if value is None:
@@ -438,10 +423,8 @@ class AbstainWhenUnderdetermined(_Rule):
     escalate_to: NonEmptyStr
 
     def check(self, traj: Trajectory, upto: int) -> Violation | None:
-        step = self._subject(traj, upto)
-        if not isinstance(step, LLMCall):
-            return None
-        if step.tool_calls_requested or not (step.response_text or "").strip():
+        step = traj.step_at(upto)
+        if not isinstance(step, LLMCall) or not step.answered:
             return None
         return Violation(
             constraint_id=self.id,
@@ -469,8 +452,11 @@ ConstraintRule = Annotated[
     | AbstainWhenUnderdetermined,
     Field(discriminator="type"),
 ]
-"""The six built-ins, tagged by `type`. Untagged, a rule with a typo in an
-optional field would load as whichever member accepts the remaining keys."""
+"""The six built-in rule types, tagged by `type`.
+
+Untagged, a rule with a typo in an optional field would load as whichever
+member accepts the remaining keys.
+"""
 
 
 class UnknownConstraintError(KeyError):
@@ -478,7 +464,7 @@ class UnknownConstraintError(KeyError):
 
 
 class ConstraintSet(Record):
-    """The policy, loaded once and read by all four consumers.
+    """The policy: a version and its rules, loaded once and read by all consumers.
 
     `source_sha256` is over the file's bytes, not this model, so a library
     change cannot move `constraint_set_sha256` while the policy stands still.
@@ -491,8 +477,11 @@ class ConstraintSet(Record):
 
     @model_validator(mode="after")
     def check_ids_are_unique(self) -> Self:
-        """`blocked_by`, a violation and an instance's constraint list all name
-        a rule by id. Two rules under one id make each of those a guess."""
+        """Reject two rules under one id.
+
+        `blocked_by`, a violation and an instance's constraint list all name
+        a rule by id. Two rules under one id make each of those a guess.
+        """
 
         seen: set[str] = set()
         for rule in self.constraints:
@@ -506,9 +495,11 @@ class ConstraintSet(Record):
 
     @model_validator(mode="after")
     def check_abstention_hands_off_to_a_tool_that_ends_the_run(self) -> Self:
-        """`escalate_to` is rendered into the prompt. Naming a tool no
-        `Terminal` rule declares tells the agent to hand off to a call the
-        guard treats as an ordinary step."""
+        """Reject an `escalate_to` that no `Terminal` rule declares.
+
+        `escalate_to` is rendered into the prompt. Naming a tool the guard
+        treats as an ordinary step tells the agent to hand off to nothing.
+        """
 
         ends = set(self.terminal_tools)
         if not ends:
@@ -528,11 +519,39 @@ class ConstraintSet(Record):
 
     @property
     def ids(self) -> tuple[str, ...]:
+        """Return the rule ids, in this set's order."""
+
         return tuple(rule.id for rule in self.constraints)
 
     @property
+    def terminal_tools(self) -> tuple[str, ...]:
+        """Return the tool names that end a run, from the `Terminal` rules.
+
+        The loop and the scorer read this rather than hard-coding a name;
+        pair with `Trajectory.ends_with_tool`.
+        """
+
+        return tuple(
+            rule.tool for rule in self.constraints if isinstance(rule, Terminal)
+        )
+
+    @property
+    def abstention_ids(self) -> tuple[str, ...]:
+        """Return the ids of the `AbstainWhenUnderdetermined` rules.
+
+        By type, not by a known id, so renaming the rule in the policy file
+        cannot switch off the check that an ambiguous instance selects one.
+        """
+
+        return tuple(
+            rule.id
+            for rule in self.constraints
+            if isinstance(rule, AbstainWhenUnderdetermined)
+        )
+
+    @property
     def required_arguments(self) -> Mapping[str, frozenset[str]]:
-        """Every tool this policy names, and the arguments it reads on each.
+        """Return, per tool the policy names, the argument keys it reads.
 
         The tool contract of spec §11, in executable form. Tools with no
         arguments read map to an empty set, so the keys are the tool inventory.
@@ -542,7 +561,7 @@ class ConstraintSet(Record):
 
     @property
     def required_result_fields(self) -> Mapping[str, frozenset[str]]:
-        """Every tool this policy names, and the result keys it reads on each.
+        """Return, per tool the policy names, the result keys it reads.
 
         The more dangerous half: a renamed result key under `Threshold` means
         no breach is ever detected and the over-budget cases score clean.
@@ -553,6 +572,8 @@ class ConstraintSet(Record):
     def _dependencies(
         self, read: Callable[[ConstraintRule], Dependencies]
     ) -> Mapping[str, frozenset[str]]:
+        """Merge what `read` returns for every rule into one frozen mapping."""
+
         collected: dict[str, set[str]] = {}
         for rule in self.constraints:
             for tool, names in read(rule):
@@ -560,18 +581,11 @@ class ConstraintSet(Record):
         # Frozen, so a caller cannot edit the contract and pass it on.
         return FrozenDict({tool: frozenset(names) for tool, names in collected.items()})
 
-    @property
-    def terminal_tools(self) -> tuple[str, ...]:
-        """Tool names that end a run. The loop and the scorer read this rather
-        than hard-coding a name; pair with `Trajectory.ends_with_tool`."""
-
-        return tuple(
-            rule.tool for rule in self.constraints if isinstance(rule, Terminal)
-        )
-
     def select(self, ids: Iterable[str]) -> ConstraintSet:
-        """The subset an instance is judged against, in this set's order. An
-        unknown id raises: it would otherwise score as full compliance."""
+        """Return the subset an instance is judged against, in this set's order.
+
+        An unknown id raises: it would otherwise score as full compliance.
+        """
 
         wanted = set(ids)
         unknown = sorted(wanted - set(self.ids))
@@ -592,15 +606,21 @@ class ConstraintSet(Record):
         )
 
     def check_step(self, traj: Trajectory, upto: int) -> tuple[Violation, ...]:
-        """Every rule against the step at `upto`. All of them, not the first:
-        a guard reporting one would send the agent to fix it and block again."""
+        """Return every violation of the step at `upto`.
+
+        All of them, not the first: a guard reporting one would send the agent
+        to fix it and block again for the next.
+        """
 
         found = (rule.check(traj, upto) for rule in self.constraints)
         return tuple(violation for violation in found if violation is not None)
 
     def evaluate(self, traj: Trajectory) -> tuple[Violation, ...]:
-        """Every violation in a finished run, in step order. Violations on
-        blocked calls are included; `traj.steps[i].blocked` tells them apart."""
+        """Return every violation in a finished run, in step order.
+
+        Violations on blocked calls are included; `traj.steps[i].blocked`
+        tells them apart.
+        """
 
         return tuple(
             violation
@@ -623,6 +643,9 @@ class ConstraintSet(Record):
 
     @classmethod
     def from_path(cls, path: Path | str) -> Self:
-        """Read a policy file as bytes, so line endings cannot change the hash."""
+        """Read a policy file from disk.
+
+        As bytes, so a platform's line endings cannot change the hash.
+        """
 
         return cls.from_yaml(Path(path).read_bytes())

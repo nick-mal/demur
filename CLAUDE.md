@@ -15,7 +15,7 @@ If code and spec disagree, that is a bug in one of them. Fix both in the same ch
 
 ```bash
 uv sync
-uv run pytest                  # 181 tests, ~0.2s — run them on every change
+uv run pytest                  # 187 tests, ~0.2s — run them on every change
 uv run ruff check .            # explicit ruleset in pyproject.toml, RUF100 on
 uv run ruff format .
 uv run pyright                 # src and tests; lists and string enums do not pass
@@ -28,6 +28,7 @@ CI runs `ruff check`, `ruff format --check`, `pyright`, and `pytest`. Everything
 1. **The boundary is enforced, not aspirational.** Nothing under `src/demur/` may import from `examples/`; `tests/test_boundary.py` walks the AST of every library module, relative-import escapes included. If the library appears to need domain knowledge, lift the concept into the library — do not import the specimen.
 2. **The library knows no SQL and no tool names.** Which tool escalates is domain knowledge and arrives via the constraint set (see `Trajectory.ends_with_tool`), never hard-coded.
 3. **Four protocols and one provider seam** (spec §5) are the sanctioned abstraction points. There is no `Constraint` protocol: the six rule types are a closed set. No registries, no config-driven dispatch, no compatibility shims.
+4. **Readers use the record's API, not its fields.** The policy layer reaches a trajectory through `step_at`, `successful_calls_before`, `ToolCall.succeeded`, `ToolCall.result_fields` and `Completion.answered`, never by indexing `steps` or comparing `outcome.status`. The dataset loader reaches the policy through `abstention_ids` and `terminal_tools`. A new reader that needs more gets a method, not a field access.
 
 ## Data-model invariants
 
@@ -55,11 +56,11 @@ Each has a validator whose message explains itself and a test named after it. Th
 
 ## Style
 
-- Comments and docstrings keep the **why** and nothing else: the invariant, the failure it prevents, the alternative rejected. Drop restatement of the spec, history, ticket ids, project status, and what tests do.
+- Every docstring opens with a one-line summary of what the thing is or does, as in any library: `Return the step at index`, `Reject a naive started_at`, `One agent run against one instance`. The **why** follows after a blank line: the invariant, the failure it prevents, the alternative rejected. Nothing else: no restatement of the spec, history, ticket ids, project status, or what tests do.
 - Write for a tired reader. Short sentences, one idea each, subject then verb. No asides in dashes or brackets. No rhetorical build-up. Plain words.
-- Length limits: module docstring 10 lines, class 6, method or validator 3, field comment 2. An argument that needs more goes in `docs/spec.md`, and the docstring cites the section.
+- Length limits, summary line included: module docstring 10 lines, class 6, method or validator 4, field comment 2. An argument that needs more goes in `docs/spec.md`, and the docstring cites the section.
 - Error messages are two sentences: what is wrong, what to do.
-- Example. Before: *"A run at 'whatever the provider defaults to' is not a measurement. Provider defaults change under stable model aliases, so a run recorded without a temperature cannot be reproduced even in principle, and a later run that differs cannot be attributed: the candidate changed, or the default did, and the artifacts do not say which."* After: *"`None` means the provider chose. Provider defaults move under stable aliases, so the run cannot be reproduced. `0` is fine; unset is not."*
+- Example. Before: *"A run at 'whatever the provider defaults to' is not a measurement. Provider defaults change under stable model aliases, so a run recorded without a temperature cannot be reproduced even in principle, and a later run that differs cannot be attributed: the candidate changed, or the default did, and the artifacts do not say which."* After: *"Reject a manifest whose sampling has no temperature. `None` means the provider chose, and provider defaults move under stable aliases, so the run cannot be reproduced. `0` is fine."*
 - Python 3.13, pydantic v2, 88-column ruff formatter.
 - British spelling in prose, matching the spec.
 

@@ -11,32 +11,37 @@ from typing import Self
 
 from pydantic import Field, model_validator
 
-from demur.policy.constraints import AbstainWhenUnderdetermined, ConstraintSet
+from demur.policy.constraints import ConstraintSet
 from demur.record import FrozenDict, FrozenJson, FrozenJsonObject, NonEmptyStr, Record
 
 
 class Split(StrEnum):
+    """Which half of the dataset an instance belongs to."""
+
     DEV = "dev"
     TEST = "test"
 
 
 class Resolution(StrEnum):
-    """How a correct agent resolves this request. Authored, not inferred."""
+    """How a correct agent resolves a request. Authored, never inferred."""
 
     ANSWER = "answer"
     ESCALATE = "escalate"
 
 
 class Origin(StrEnum):
-    """Who wrote this instance. Recorded because the validity argument depends
-    on it: nothing comes from the system under test or the judge model."""
+    """Who wrote an instance.
+
+    Recorded because the validity argument depends on it: nothing comes from
+    the system under test or the judge model, and a reader can check the mix.
+    """
 
     AUTHORED = "authored"
     DRAFTED = "drafted"
 
 
 class Expected(Record):
-    """The authored expectation for this instance."""
+    """The authored expectation for an instance."""
 
     resolution: Resolution
     # Why escalation is correct. Free text for a human reader; scorers key on
@@ -45,6 +50,8 @@ class Expected(Record):
 
     @model_validator(mode="after")
     def check_answers_have_no_escalation_reason(self) -> Self:
+        """Reject an escalation reason on an instance expected to be answered."""
+
         if self.resolution is Resolution.ANSWER and self.reason is not None:
             raise ValueError(
                 "an instance expected to be answered must not carry an "
@@ -54,7 +61,7 @@ class Expected(Record):
 
 
 class Interpretation(Record):
-    """One defensible reading of the request, with its authored answer.
+    """One defensible reading of a request, with its authored answer.
 
     Ambiguity is constructed by enumerating these, not judged. Escalation is
     correct when the request selects none of them, which a reader can check.
@@ -63,13 +70,13 @@ class Interpretation(Record):
 
     id: NonEmptyStr
     description: NonEmptyStr
-    # Opaque to the library. The warehouse example puts a query and its rows
-    # here; another domain puts something else.
+    # The correct output under this reading. Opaque to the library: the
+    # warehouse example puts a query and its rows here.
     reference_output: FrozenJson = None
 
 
 class Instance(Record):
-    """One evaluation case."""
+    """One evaluation case: a request and everything needed to judge the answer."""
 
     id: NonEmptyStr
     request: NonEmptyStr
@@ -85,12 +92,17 @@ class Instance(Record):
 
     @property
     def is_ambiguous(self) -> bool:
-        """More than one defensible reading, so answering either is a guess."""
+        """Return whether the request has more than one defensible reading.
+
+        Answering either of them is then a guess.
+        """
 
         return len(self.interpretations) > 1
 
     @model_validator(mode="after")
     def check_interpretation_ids_are_unique(self) -> Self:
+        """Reject two interpretations sharing an id."""
+
         seen: set[str] = set()
         for interpretation in self.interpretations:
             if interpretation.id in seen:
@@ -103,9 +115,12 @@ class Instance(Record):
 
     @model_validator(mode="after")
     def check_ambiguous_cases_expect_escalation(self) -> Self:
-        """Definitional: two readings and an expected answer asks the agent to
+        """Reject an ambiguous instance that expects an answer.
+
+        Definitional: two readings and an expected answer asks the agent to
         guess and calls the guess correct. Not the converse: a restricted
-        column or an over-budget query escalates with one reading."""
+        column or an over-budget query escalates with one reading.
+        """
 
         if self.is_ambiguous and self.expected.resolution is not Resolution.ESCALATE:
             raise ValueError(
@@ -117,8 +132,11 @@ class Instance(Record):
 
     @model_validator(mode="after")
     def check_answerable_cases_have_something_to_check(self) -> Self:
-        """`result_correct` compares against the reference output of the
-        intended reading. With none there is nothing to compare against."""
+        """Reject an answerable instance with no interpretation.
+
+        `result_correct` compares against the reference output of the intended
+        reading. With none there is nothing to compare against.
+        """
 
         if self.expected.resolution is Resolution.ANSWER and not self.interpretations:
             raise ValueError(
@@ -132,25 +150,20 @@ class Instance(Record):
 def check_constraints_cover_ambiguity(
     instance: Instance, policy: ConstraintSet
 ) -> None:
-    """An ambiguous instance must select an abstention rule.
+    """Raise `ValueError` if an ambiguous instance selects no abstention rule.
 
     `ConstraintSet.select` catches the loud direction, an unknown id. This is
     the quiet one: an ambiguous case that forgets the rule passes every
     constraint it did select and scores as full compliance while testing
-    nothing. Keyed on the rule type, not an id, so renaming the rule in the
-    policy file cannot switch the check off. Raises: an unscorable dataset is
-    not one to run against.
+    nothing. Raises rather than reporting: an unscorable dataset is not one to
+    run against.
     """
 
     if not instance.is_ambiguous:
         return
 
     selected = set(instance.constraints)
-    available = tuple(
-        rule.id
-        for rule in policy.constraints
-        if isinstance(rule, AbstainWhenUnderdetermined)
-    )
+    available = policy.abstention_ids
     if any(name in selected for name in available):
         return
 

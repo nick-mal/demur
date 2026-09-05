@@ -33,13 +33,13 @@ class Sampling(Record):
     # The provider's sampling seed. `RunManifest.seed` seeds the harness.
     seed: int | None = None
     stop: tuple[str, ...] = ()
-    # Named fields only where every provider has the knob; normalising the rest
-    # is the compatibility layer spec §15 rules out.
+    # Knobs this model does not name, recorded verbatim. Normalising them is
+    # the compatibility layer spec §15 rules out.
     extra: FrozenJsonObject = Field(default_factory=FrozenDict)
 
     @property
     def specified(self) -> bool:
-        """Whether anything was pinned at all."""
+        """Return whether any parameter was pinned at all."""
 
         knobs = (
             name for name in type(self).model_fields if name not in ("stop", "extra")
@@ -50,7 +50,10 @@ class Sampling(Record):
 
     @model_validator(mode="after")
     def check_extra_does_not_shadow_a_named_field(self) -> Self:
-        """Two places to read one parameter is one too many."""
+        """Reject an `extra` key that repeats a named field.
+
+        Two places to read one parameter is one too many.
+        """
 
         shadowed = sorted(set(self.extra) & set(type(self).model_fields))
         if shadowed:

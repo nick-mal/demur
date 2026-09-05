@@ -30,11 +30,12 @@ from demur.record import (
 from demur.sampling import Sampling
 
 SCHEMA_VERSION = "1"
-"""Bump when an older committed trajectory would no longer load.
+"""The schema version written into every new trajectory.
 
-An optional field with a default is additive and does not bump. A field
-joining a required set does. Until a run is committed there is no evidence to
-protect, so a breaking change rewrites the schema in place.
+Bump when an older committed trajectory would no longer load. An optional
+field with a default is additive and does not bump; a field joining a required
+set does. Until a run is committed there is no evidence to protect, so a
+breaking change rewrites the schema in place.
 """
 
 _USAGE_BUCKETS = (
@@ -47,7 +48,7 @@ _USAGE_BUCKETS = (
 
 
 class Usage(Record):
-    """Token billing buckets for one call. See spec §4, Usage.
+    """Token counts for one call, in billing buckets. See spec §4, Usage.
 
     Each field exists because some provider prices those tokens differently.
     The three prompt buckets are disjoint; `reasoning_tokens` is inside
@@ -57,22 +58,24 @@ class Usage(Record):
 
     input_tokens: TokenCount | None = None
     output_tokens: TokenCount | None = None
-    # Served from cache, billed at a discount where the provider has one.
+    # Prompt tokens served from cache, billed at a discount where one exists.
     cached_input_tokens: TokenCount | None = None
-    # Written into a cache, billed at a premium where the provider has one.
+    # Prompt tokens written into a cache, billed at a premium where one exists.
     cache_creation_input_tokens: TokenCount | None = None
     reasoning_tokens: TokenCount | None = None
 
     @property
     def reported(self) -> bool:
-        """Whether the provider said anything at all. Any field counts, so a
-        half-report is visible to the validator."""
+        """Return whether the provider reported any count at all.
+
+        Any field counts, so a half-report is visible to the validator.
+        """
 
         return any(getattr(self, name) is not None for name in type(self).model_fields)
 
     @property
     def total_tokens(self) -> int | None:
-        """Prompt buckets plus output, or `None` when nothing was reported."""
+        """Return prompt buckets plus output, or `None` if nothing was reported."""
 
         if not self.reported:
             return None
@@ -81,7 +84,10 @@ class Usage(Record):
 
     @model_validator(mode="after")
     def check_reasoning_fits_inside_output(self) -> Self:
-        """Reasoning is the thinking part of the output, not a bucket beside it."""
+        """Reject reasoning tokens that exceed output tokens.
+
+        Reasoning is the thinking part of the output, not a bucket beside it.
+        """
 
         if self.reasoning_tokens is None or self.output_tokens is None:
             return self
@@ -95,8 +101,10 @@ class Usage(Record):
 
     @model_validator(mode="after")
     def check_usage_is_all_or_nothing(self) -> Self:
-        """Either nothing was reported or every bucket was. A missing bucket
-        would silently drop tokens from `total_tokens`."""
+        """Reject a usage that reports some buckets and not others.
+
+        A missing bucket would silently drop tokens from `total_tokens`.
+        """
 
         if not self.reported:
             return self
@@ -111,9 +119,9 @@ class Usage(Record):
 
 
 class _ToolInvocation(Record):
-    """What a request and its dispatch share."""
+    """Fields shared by a tool request and its dispatch."""
 
-    # Required: a call that cannot be paired with its other half is not
+    # Pairs a request with its dispatch. Required: an unpaired call is not
     # evidence. A provider that emits no id leaves the adapter to make one.
     call_id: NonEmptyStr
     name: NonEmptyStr
@@ -124,7 +132,10 @@ class _ToolInvocation(Record):
 
     @model_validator(mode="after")
     def check_unparsed_arguments_are_not_also_parsed(self) -> Self:
-        """Both set means one of them is invented."""
+        """Reject parsed arguments beside `raw_arguments`.
+
+        Both set means one of them is invented.
+        """
 
         if self.raw_arguments is not None and self.arguments:
             raise ValueError(
@@ -144,16 +155,16 @@ class ToolRequest(_ToolInvocation):
 
 
 class Message(Record):
-    """One conversation entry, faithful enough to replay.
+    """One entry of the conversation as sent to the provider.
 
-    An assistant turn that only calls tools has no content and carries the
-    calls, which is what every provider emits.
+    Faithful enough to replay: an assistant turn that only calls tools has no
+    content and carries the calls, which is what every provider emits.
     """
 
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
-    # Assistant turns only. Carried here so a rebuilt prompt can be replayed:
-    # a provider continuing a turn that contained thinking expects it back.
+    # Assistant turns only: what the model thought. Carried so a rebuilt prompt
+    # can be replayed; a provider continuing such a turn expects it back.
     reasoning_text: str | None = None
     # Assistant turns only: the calls this turn asked for.
     tool_calls: tuple[ToolRequest, ...] = ()
@@ -162,8 +173,11 @@ class Message(Record):
 
     @model_validator(mode="after")
     def check_shape_matches_role(self) -> Self:
-        """Thinking alone is not a turn: a model that only thought contributes
-        no message."""
+        """Reject fields that do not belong to the message's role.
+
+        Thinking alone is not a turn: a model that only thought contributes
+        no message.
+        """
 
         if self.role != "assistant" and self.tool_calls:
             raise ValueError(f"a {self.role} message cannot request tool calls")
@@ -195,8 +209,8 @@ class Completion(Record):
 
     model: NonEmptyStr
     response_text: str | None = None
-    # Thinking, beside the content as every provider reports it. `None` does
-    # not mean the model did not think; nothing ties it to `reasoning_tokens`.
+    # What the model thought, beside the content as every provider reports it.
+    # `None` does not mean it did not think; unrelated to `reasoning_tokens`.
     reasoning_text: str | None = None
     # Each request that reached the dispatcher also appears as a `ToolCall`,
     # paired on `call_id`, including one the guard blocked.
@@ -209,11 +223,24 @@ class Completion(Record):
     provider_request_id: str | None = None
 
     @property
+    def answered(self) -> bool:
+        """Return whether the model replied in prose and asked for no tool.
+
+        That is the agent giving its answer, and the loop stops there.
+        """
+
+        return not self.tool_calls_requested and bool(
+            (self.response_text or "").strip()
+        )
+
+    @property
     def assistant_turn(self) -> Message | None:
-        """The reply as a message. Derived, not stored, so a replay and the
-        invalid-attempt count read the same thing. `None` when nothing was
-        said or asked. Not byte-exact against Anthropic: thinking-block
-        signatures are not modelled."""
+        """Return the reply as an assistant `Message`, or `None` if it was empty.
+
+        Derived, not stored, so a replay and the invalid-attempt count read
+        the same thing. Not byte-exact against Anthropic: thinking-block
+        signatures are not modelled.
+        """
 
         if not (self.response_text or "").strip() and not self.tool_calls_requested:
             return None
@@ -239,8 +266,11 @@ class LLMCall(Completion):
 
     @model_validator(mode="after")
     def check_the_reply_is_not_also_in_the_delta(self) -> Self:
-        """A delta ending in an assistant turn is this call's reply stored
-        twice. Few-shot exemplars are fine; they are never last."""
+        """Reject a delta that ends with an assistant turn.
+
+        That is where this call's own reply would land, stored twice. Few-shot
+        exemplars are fine; they are never last.
+        """
 
         if self.messages_appended and self.messages_appended[-1].role == "assistant":
             raise ValueError(
@@ -252,6 +282,8 @@ class LLMCall(Completion):
 
 
 class OutcomeStatus(StrEnum):
+    """How a tool call ended."""
+
     OK = "ok"
     ERROR = "error"
     # Refused by the guard before execution. Not an error: the tool never ran.
@@ -267,6 +299,8 @@ class ToolOutcome(Record):
 
     @model_validator(mode="after")
     def check_fields_match_status(self) -> Self:
+        """Reject a `result` or `error` inconsistent with `status`."""
+
         if self.status is OutcomeStatus.ERROR and not self.error:
             raise ValueError("an error outcome must carry an error message")
         if self.status is not OutcomeStatus.ERROR and self.error is not None:
@@ -296,12 +330,37 @@ class ToolCall(_ToolInvocation):
 
     @property
     def blocked(self) -> bool:
+        """Return whether the guard refused this call before it ran."""
+
         return self.outcome.status is OutcomeStatus.BLOCKED
+
+    @property
+    def succeeded(self) -> bool:
+        """Return whether the tool ran and reported success.
+
+        A blocked or errored call did nothing, so it satisfies no prerequisite
+        and produces no side effect.
+        """
+
+        return self.outcome.status is OutcomeStatus.OK
+
+    @property
+    def result_fields(self) -> Mapping[str, Any]:
+        """Return the result as a mapping, or an empty one if it is not an object.
+
+        A tool may return a list or a scalar; a rule reading a named field
+        simply does not apply to it.
+        """
+
+        return self.outcome.result if isinstance(self.outcome.result, Mapping) else {}
 
     @model_validator(mode="after")
     def check_blocking_is_recorded_on_both_sides(self) -> Self:
-        """A block with no constraint cannot be attributed. A constraint on a
-        call that ran means the guard was consulted and ignored."""
+        """Reject a blocked status without `blocked_by`, or the reverse.
+
+        A block with no constraint cannot be attributed. A constraint on a
+        call that ran means the guard was consulted and ignored.
+        """
 
         if self.blocked and self.blocked_by is None:
             raise ValueError(
@@ -318,6 +377,8 @@ class ToolCall(_ToolInvocation):
 
     @model_validator(mode="after")
     def check_unparsed_arguments_did_not_succeed(self) -> Self:
+        """Reject a successful outcome on a call whose arguments never parsed."""
+
         if self.raw_arguments is not None and self.outcome.status is OutcomeStatus.OK:
             raise ValueError(
                 f"tool call {self.name!r} succeeded despite arguments that could "
@@ -328,7 +389,7 @@ class ToolCall(_ToolInvocation):
 
 
 Step = Annotated[LLMCall | ToolCall, Field(discriminator="kind")]
-"""One or the other; `kind` decides on the way back from JSON.
+"""One step of a run: an LLM call or a tool call, told apart by `kind`.
 
 Without the discriminator a round trip can silently produce the wrong step
 type while an equality test still passes.
@@ -336,8 +397,11 @@ type while an equality test still passes.
 
 
 class TerminalState(StrEnum):
-    """Why the loop stopped. `ESCALATED` is separate from `COMPLETED` because
-    abstention is a correct outcome, and the two must never be aggregated."""
+    """Why the agent loop stopped.
+
+    `ESCALATED` is separate from `COMPLETED` because abstention is a correct
+    outcome, and the two must never be aggregated.
+    """
 
     COMPLETED = "completed"
     ESCALATED = "escalated"
@@ -350,7 +414,11 @@ class TerminalState(StrEnum):
 
 
 class Trajectory(Record):
-    """One agent run against one instance."""
+    """One agent run against one instance.
+
+    Readers use the methods below rather than indexing `steps`, so the policy
+    layer never depends on how a step records its outcome.
+    """
 
     schema_version: str = SCHEMA_VERSION
     run_id: NonEmptyStr
@@ -366,25 +434,63 @@ class Trajectory(Record):
 
     @property
     def llm_calls(self) -> tuple[LLMCall, ...]:
+        """Return the LLM calls, in order."""
+
         return tuple(step for step in self.steps if isinstance(step, LLMCall))
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
+        """Return the tool calls, in order."""
+
         return tuple(step for step in self.steps if isinstance(step, ToolCall))
 
     @property
     def blocked_calls(self) -> tuple[ToolCall, ...]:
+        """Return the tool calls the guard refused."""
+
         return tuple(call for call in self.tool_calls if call.blocked)
 
-    def prompt_at(self, index: int) -> tuple[Message, ...]:
-        """The request as sent for the LLM call at `index`: earlier deltas
-        interleaved with the replies between them, then this call's delta.
-        Nothing after, or the provider would be asked to continue past its
-        own answer."""
+    def step_at(self, index: int) -> Step:
+        """Return the step at `index`, or raise `IndexError` with a remedy.
 
-        if index < 0:
-            raise IndexError(f"step index must not be negative, got {index}")
-        step = self.steps[index]
+        The guard judges a call before making it by appending it and asking
+        about its index, so the error says so rather than reading as a bug.
+        """
+
+        if index < 0 or index >= len(self.steps):
+            raise IndexError(
+                f"no step at index {index}: the trajectory has {len(self.steps)} "
+                "steps. To judge a call before making it, append it and ask "
+                "about its index."
+            )
+        return self.steps[index]
+
+    def successful_calls_before(
+        self, index: int, name: str | None = None
+    ) -> tuple[ToolCall, ...]:
+        """Return the tool calls before `index` that succeeded, by `name` if given.
+
+        The view a constraint gets of the past: what happened and stuck. A
+        blocked or failed call did nothing, so it is left out.
+        """
+
+        return tuple(
+            step
+            for step in self.steps[:index]
+            if isinstance(step, ToolCall)
+            and step.succeeded
+            and (name is None or step.name == name)
+        )
+
+    def prompt_at(self, index: int) -> tuple[Message, ...]:
+        """Return the request as sent for the LLM call at `index`.
+
+        Earlier deltas interleaved with the replies between them, then this
+        call's delta and nothing after. Including this call's own reply would
+        ask the provider to continue past its own answer.
+        """
+
+        step = self.step_at(index)
         if not isinstance(step, LLMCall):
             raise TypeError(
                 f"step {index} is a {step.kind}, not an LLM call. Only LLM calls "
@@ -401,22 +507,24 @@ class Trajectory(Record):
         return tuple(prompt)
 
     def ends_with_tool(self, name: str) -> bool:
-        """Whether the last step is a successful call to `name`. Which tool
-        escalates is domain knowledge, so the `Terminal` rule supplies it."""
+        """Return whether the last step is a successful call to `name`.
+
+        Which tool escalates is domain knowledge, so the `Terminal` rule
+        supplies the name and this is the check it drives.
+        """
 
         if not self.steps:
             return False
         last = self.steps[-1]
-        return (
-            isinstance(last, ToolCall)
-            and last.name == name
-            and last.outcome.status is OutcomeStatus.OK
-        )
+        return isinstance(last, ToolCall) and last.name == name and last.succeeded
 
     @model_validator(mode="after")
     def check_step_indices_match_position(self) -> Self:
-        """`index` is a second source of truth for the ordering. A violation
-        report quotes it, so a mismatch points a reader at the wrong step."""
+        """Reject a step whose `index` differs from its position.
+
+        `index` is a second source of truth for the ordering. A violation
+        report quotes it, so a mismatch points a reader at the wrong step.
+        """
 
         for position, step in enumerate(self.steps):
             if step.index != position:
@@ -428,8 +536,11 @@ class Trajectory(Record):
 
     @model_validator(mode="after")
     def check_call_ids_are_unique(self) -> Self:
-        """Duplicate ids make the request-to-dispatch pairing ambiguous. The
-        duplicate-call fault profile must show as two calls, not one."""
+        """Reject two tool calls sharing a `call_id`.
+
+        Duplicate ids make the request-to-dispatch pairing ambiguous. The
+        duplicate-call fault profile must show as two calls, not one.
+        """
 
         seen: set[str] = set()
         for call in self.tool_calls:
@@ -443,9 +554,12 @@ class Trajectory(Record):
 
     @model_validator(mode="after")
     def check_terminal_state_matches_content(self) -> Self:
-        """Only the domain-blind half: a completed run said something, and
+        """Reject a terminal state the steps and answer contradict.
+
+        Only the domain-blind half: a completed run said something, and
         neither completing nor escalating happens without a step. That an
-        escalated run ends in the escalation tool is the `Terminal` rule's job."""
+        escalated run ends in the escalation tool is the `Terminal` rule's job.
+        """
 
         answered = TerminalState.COMPLETED
         if self.terminal_state is answered and self.final_answer is None:
@@ -480,7 +594,7 @@ _LOADERS: dict[str, Callable[[Mapping[str, Any]], Trajectory]] = {
 
 
 def load_trajectory(data: str | bytes | Mapping[str, Any]) -> Trajectory:
-    """Read a committed trajectory, dispatching on `schema_version`.
+    """Parse a committed trajectory, dispatching on its `schema_version`.
 
     When the schema changes, add a converting loader keyed on the old version.
     Never edit a committed trajectory to match new code.

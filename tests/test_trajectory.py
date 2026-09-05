@@ -721,3 +721,69 @@ def test_an_additive_field_does_not_orphan_the_golden_fixture() -> None:
     assert all(
         call.reasoning_text is None for call in load_trajectory(payload).llm_calls
     )
+
+
+def test_step_at_says_how_to_judge_a_call_before_making_it(
+    trajectory: Trajectory,
+) -> None:
+    """The guard appends the call and asks about its index; the error says so."""
+
+    assert trajectory.step_at(1).index == 1
+
+    with pytest.raises(IndexError, match="append it and ask about its index"):
+        trajectory.step_at(len(trajectory.steps))
+    with pytest.raises(IndexError):
+        trajectory.step_at(-1)
+
+
+def test_successful_calls_before_exclude_blocked_and_failed_calls(
+    trajectory: Trajectory,
+) -> None:
+    """A blocked or failed call did nothing, so it satisfies no prerequisite."""
+
+    assert trajectory.successful_calls_before(2) == ()
+    assert [call.name for call in trajectory.successful_calls_before(4)] == [
+        "describe_schema"
+    ]
+    assert trajectory.successful_calls_before(4, "run_query") == ()
+    assert trajectory.successful_calls_before(4, "describe_schema")[0].index == 3
+
+
+def test_a_tool_call_succeeded_only_if_it_ran_and_reported_ok(
+    trajectory: Trajectory,
+) -> None:
+    blocked, described = trajectory.tool_calls
+
+    assert blocked.blocked
+    assert not blocked.succeeded
+    assert described.succeeded
+    assert not described.blocked
+
+
+def test_result_fields_are_empty_unless_the_result_is_an_object(
+    trajectory: Trajectory,
+) -> None:
+    """A rule reading a named field simply does not apply to a list result."""
+
+    described = trajectory.tool_calls[1]
+    listed = described.model_copy(
+        update={"outcome": ToolOutcome(status=OutcomeStatus.OK, result=[1, 2])}
+    )
+
+    assert described.result_fields["restricted"] is False
+    assert listed.result_fields == {}
+
+
+def test_an_llm_call_answered_when_it_returned_prose_and_asked_for_nothing(
+    trajectory: Trajectory,
+) -> None:
+    """Answering is what the abstention rule flags, and thinking alone is not it."""
+
+    asked, _, answered = trajectory.llm_calls
+    thought_only = answered.model_copy(
+        update={"response_text": None, "reasoning_text": "still thinking"}
+    )
+
+    assert not asked.answered
+    assert answered.answered
+    assert not thought_only.answered

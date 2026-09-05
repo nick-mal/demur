@@ -1284,3 +1284,15 @@ def test_a_run_that_skips_every_check_draws_the_violation_it_should() -> None:
         "dry_run_before_execute",
         "abstain_when_underdetermined",
     }
+
+
+def test_abstention_rules_are_found_by_type_not_by_name() -> None:
+    """The dataset loader asks the set which ids abstain, so renaming the rule
+    in the policy file cannot switch its check off."""
+
+    policy = ConstraintSet.from_path(POLICY)
+
+    assert policy.abstention_ids == ("abstain_when_underdetermined",)
+    assert (
+        ConstraintSet(version="v", constraints=(ESCALATION_ENDS,)).abstention_ids == ()
+    )

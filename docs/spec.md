@@ -92,7 +92,7 @@ The two prompt hashes are how the experimental control is *proved* rather than a
 
 **`Instance`** — one evaluation case. `id` · `request` · `fixture_state` · `constraints` (a partial order, not a golden path) · `expected` (resolution class) · `interpretations` (list, each carrying its own `reference_output`; length > 1 marks the case ambiguous) · `split` (`dev` | `test`) · `origin` (`authored` | `drafted`). Content-addressed over its **source bytes on disk**, never over the parsed model: hashing the model would fold the library's own shape into dataset identity, so adding a defaulted field would rewrite every instance hash and invalidate committed baselines while nothing about the data had changed. Two invariants are enforced at load: an instance with more than one interpretation must expect escalation, since that is what ambiguity *means*; and one expected to be answered must enumerate at least one reading, or there is no reference output to score against.
 
-**`Trajectory`** — one agent run against one instance. `schema_version` · `run_id` · `instance_id` · `repeat_index` · `steps[]` · `wall_ms` · `terminal_state` · `final_answer` · `provider_meta`. Run-level identity lives on the manifest, not here. `final_answer` is present exactly when the run `completed`: a run that escalated, exhausted its steps, or failed stopped without answering, and whatever the model said last is in that step's `response_text` rather than promoted to the run's answer.
+**`Trajectory`** — one agent run against one instance. `schema_version` · `run_id` · `instance_id` · `repeat_index` · `steps[]` · `wall_ms` · `terminal_state` · `final_answer` · `provider_meta`. Run-level identity lives on the manifest, not here. Readers use `step_at`, `successful_calls_before`, `prompt_at` and `ends_with_tool` rather than the `steps` tuple, and `ToolCall.succeeded`, `ToolCall.result_fields` and `Completion.answered` rather than the outcome fields, so the constraint engine never depends on how a step records what became of it. `final_answer` is present exactly when the run `completed`: a run that escalated, exhausted its steps, or failed stopped without answering, and whatever the model said last is in that step's `response_text` rather than promoted to the run's answer.
 
 **`Step`** — a discriminated union on `kind`, so the loader dispatches rather than guessing.
 
@@ -173,6 +173,8 @@ classDiagram
         terminal_state
         final_answer
         wall_ms, provider_meta
+        step_at(i)
+        successful_calls_before(i)
         prompt_at(i)
         ends_with_tool(name)
     }
@@ -184,6 +186,7 @@ classDiagram
         latency_ms
         provider_request_id
         assistant_turn
+        answered
     }
     class LLMCall {
         index
@@ -194,7 +197,8 @@ classDiagram
         arguments, raw_arguments
         blocked_by, call_id
         latency_ms
-        blocked
+        blocked, succeeded
+        result_fields
     }
     class Message {
         role, content
@@ -338,7 +342,7 @@ Both directions of that selection are checked, because both fail silently. `Cons
 
 **`Violation`** — `constraint_id` · `kind` · `step_index` · `detail`. `kind` is one label per constraint *type*, not per rule, so the failure-category confusion table (§7) keeps fixed columns while a policy gains or renames rules. There is no `blocked` field: whether the guard stopped the offending call is `traj.steps[step_index].blocked`, and storing it twice would let a replay and the enforcement metrics disagree about the same step.
 
-**`ConstraintSet`** — `version` · `constraints` · `source_sha256`, loaded from YAML. The hash is over the file's bytes for the same reason instance hashes are, and it is what the manifest records as `constraint_set_sha256`. A subset returned by `select` carries no hash: it is not the file.
+**`ConstraintSet`** — `version` · `constraints` · `source_sha256`, loaded from YAML. The hash is over the file's bytes for the same reason instance hashes are, and it is what the manifest records as `constraint_set_sha256`. A subset returned by `select` carries no hash: it is not the file. `terminal_tools` and `abstention_ids` expose tool names and rule ids by rule *type*, so neither the agent loop nor the dataset loader hard-codes a name.
 
 ## 6. Execution semantics
 

@@ -17,7 +17,7 @@ from demur.sampling import Sampling
 
 
 class Treatment(StrEnum):
-    """Enforcement placement. T2 and T3 each add one thing to T1.
+    """Where enforcement sits for a run. T2 and T3 each add one thing to T1.
 
     All three carry the identical policy prompt. Stripping it from T3 would
     measure information removal, not where enforcement sits.
@@ -29,7 +29,7 @@ class Treatment(StrEnum):
 
 
 class RunManifest(Record):
-    """What was held constant for one run.
+    """Everything held constant for one run.
 
     `system_prompt_sha256` identical across T1, T2 and T3 proves no policy
     text was dropped from a treatment. `constraint_set_sha256` proves the guard
@@ -42,8 +42,8 @@ class RunManifest(Record):
     # What was evaluated.
     dataset_version: NonEmptyStr
     dataset_sha256: Sha256
-    # `id` to `version` for every scorer that ran. A version change invalidates
-    # dependent baselines.
+    # Scorer id to version, for every scorer that ran. A version change
+    # invalidates dependent baselines.
     scorer_versions: FrozenStrMap = Field(default_factory=FrozenDict)
 
     # What did the evaluating.
@@ -54,8 +54,8 @@ class RunManifest(Record):
     system_prompt_sha256: Sha256
     constraint_set_sha256: Sha256
     demur_version: NonEmptyStr
-    # What the run was configured with; enters baseline comparability. What
-    # each call actually sent is `LLMCall.sampling`.
+    # The decoding parameters the run was configured with; part of baseline
+    # comparability. What each call actually sent is `LLMCall.sampling`.
     sampling: Sampling
 
     # How it was run.
@@ -63,14 +63,17 @@ class RunManifest(Record):
     # The harness seed: instance order, fault profiles, stochastic scorers.
     # The model's seed is `sampling.seed`. `None` means not seeded, not seed 0.
     seed: int | None = None
-    # Absent until tolerance bands exist. A band edited after a candidate ran
-    # shows as a changed hash.
+    # Hash of the tolerance bands, absent until they exist. A band edited
+    # after a candidate ran shows as a changed hash.
     tolerances_sha256: Sha256 | None = None
 
     @model_validator(mode="after")
     def check_the_temperature_was_pinned(self) -> Self:
-        """`None` means the provider chose. Provider defaults move under stable
-        aliases, so the run cannot be reproduced. `0` is fine; unset is not."""
+        """Reject a manifest whose sampling has no temperature.
+
+        `None` means the provider chose, and provider defaults move under
+        stable aliases, so the run cannot be reproduced. `0` is fine.
+        """
 
         if self.sampling.temperature is None:
             raise ValueError(
@@ -81,8 +84,11 @@ class RunManifest(Record):
 
     @model_validator(mode="after")
     def check_started_at_is_absolute(self) -> Self:
-        """Runs are compared across machines and months. A naive timestamp is
-        only meaningful on the machine that wrote it."""
+        """Reject a naive `started_at`.
+
+        Runs are compared across machines and months. A naive timestamp is
+        only meaningful on the machine that wrote it.
+        """
 
         if self.started_at.tzinfo is None or self.started_at.utcoffset() is None:
             raise ValueError(
