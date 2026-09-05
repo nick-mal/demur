@@ -11,17 +11,6 @@ demur measures whether a tool-using LLM agent **refuses correctly, stays inside 
 - **Evaluation runner** on MLflow — per-item results, aggregates, OpenTelemetry traces.
 - **Regression detection** — paired bootstrap, one-sided non-inferiority, tolerance bands fixed before candidates run, per-item flips, failure-category confusion table.
 - **Fault proxy** — OpenAI-compatible shim injecting upstream failures so recovery behaviour and its cost are measurable.
-- **Cost accounting** — cost per accepted outcome, acceptance predicate supplied by the caller.# 1. What demur does
-
-demur measures whether a tool-using LLM agent **refuses correctly, stays inside policy, and does so at a known cost** — and detects when a change makes any of those worse.
-
-- **Trajectory schema** — canonical, serialisable record of what the agent did: every LLM call, every tool call, arguments, outcomes, tokens, timing.
-- **Constraint engine** — ordering and permission rules as data, evaluated against a trajectory into typed violations. One constraint set drives the system prompt, the exemplars, the runtime guard, and the scorer: one definition, four consumers.
-- **Three enforcement strategies** over that set, so the incremental effect of runtime enforcement is measured rather than assumed.
-- **Scorer protocol and registry** with mandatory versioning; a version change invalidates dependent baselines automatically.
-- **Evaluation runner** on MLflow — per-item results, aggregates, OpenTelemetry traces.
-- **Regression detection** — paired bootstrap, one-sided non-inferiority, tolerance bands fixed before candidates run, per-item flips, failure-category confusion table.
-- **Fault proxy** — OpenAI-compatible shim injecting upstream failures so recovery behaviour and its cost are measurable.
 - **Cost accounting** — cost per accepted outcome, acceptance predicate supplied by the caller.
 
 # 2 Install and run

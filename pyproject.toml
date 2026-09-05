@@ -3,17 +3,18 @@ name = "demur"
 version = "0.1.1"
 requires-python = ">=3.13"
 dependencies = [
-    "mlflow",
-    "httpx",
-    "duckdb",
     "pydantic",
-    "opentelemetry-sdk",
-    "fastapi",
-    "numpy",
-    "pytest",
-    "ruff",
     "pyyaml>=6.0.3",
 ]
+
+[project.optional-dependencies]
+# Declared by the build plan and unused until the runner (D-34) and the API
+# (D-60) land. Extras rather than dependencies so the library installs light.
+eval = ["mlflow", "duckdb", "httpx", "numpy", "opentelemetry-sdk"]
+api = ["fastapi"]
+
+[dependency-groups]
+dev = ["pytest", "ruff", "pyright"]
 
 [build-system]
 requires = ["hatchling"]
@@ -35,7 +36,7 @@ select = [
     "B",         # bugbear
     "A",         # shadowed builtins
     "C4",        # comprehensions
-    "DTZ",       # naive datetimes — timestamps in a manifest must be absolute
+    "DTZ",       # naive datetimes: timestamps in a manifest must be absolute
     "PT",        # pytest style
     "RET",       # return simplification
     "SIM",       # simplification
@@ -48,6 +49,14 @@ select = [
 # Fixtures are passed by name and are often used for their side effect of
 # building the object under test rather than read directly.
 "tests/*" = ["ARG001"]
+
+[tool.pyright]
+# The code is fully typed; without a checker in CI a wrong attribute name in a
+# test passes as the AttributeError it was meant to assert.
+include = ["src", "tests"]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
